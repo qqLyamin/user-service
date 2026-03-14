@@ -151,10 +151,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 - <<'PY' > smoke-token.txt
-          import base64, hashlib, hmac, json, os, time
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
           def b64url(data: bytes) -> str:
               return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
           header = {"alg": "HS256", "typ": "JWT"}
           payload = {
               "iss": os.environ["JWT_ISSUER"],
@@ -167,34 +176,35 @@ jobs:
           }
           signing_input = f"{b64url(json.dumps(header, separators=(',', ':')).encode())}.{b64url(json.dumps(payload, separators=(',', ':')).encode())}"
           signature = hmac.new(os.environ["JWT_SECRET"].encode(), signing_input.encode(), hashlib.sha256).digest()
-          print(f"{signing_input}.{b64url(signature)}")
-          PY
+          token = f"{signing_input}.{b64url(signature)}"
+          base_url = f"https://{os.environ['DEPLOY_HOST']}/user"
+          headers = {"Authorization": f"Bearer {token}"}
 
-          TOKEN="$(cat smoke-token.txt)"
+          def call(method: str, path: str, body=None):
+              data = None
+              req_headers = dict(headers)
+              if body is not None:
+                  req_headers["Content-Type"] = "application/json"
+                  data = json.dumps(body, separators=(",", ":")).encode()
+              request = urllib.request.Request(
+                  f"{base_url}{path}",
+                  data=data,
+                  method=method,
+                  headers=req_headers,
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      return response.status, json.loads(response.read().decode())
+              except urllib.error.HTTPError as exc:
+                  body_text = exc.read().decode()
+                  raise SystemExit(f"{method} {path} failed with {exc.code}: {body_text}") from exc
 
-          curl -k -fsS \
-            -H "Authorization: Bearer ${TOKEN}" \
-            "https://${DEPLOY_HOST}/user/v1/users/me" > me-before.json
+          before_status, before = call("GET", "/v1/users/me")
+          patch_status, patched = call("PATCH", "/v1/users/me", {"displayName": "CI Smoke Updated"})
+          after_status, after = call("GET", "/v1/users/me")
 
-          curl -k -fsS \
-            -X PATCH \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"displayName":"CI Smoke Updated"}' \
-            "https://${DEPLOY_HOST}/user/v1/users/me" > me-patch.json
-
-          curl -k -fsS \
-            -H "Authorization: Bearer ${TOKEN}" \
-            "https://${DEPLOY_HOST}/user/v1/users/me" > me-after.json
-
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          before = json.loads(Path('me-before.json').read_text(encoding='utf-8'))
-          patched = json.loads(Path('me-patch.json').read_text(encoding='utf-8'))
-          after = json.loads(Path('me-after.json').read_text(encoding='utf-8'))
-
+          assert before_status == 200, before
+          assert patch_status == 200, patched
           assert after.get('displayName') == 'CI Smoke Updated', (before, patched, after)
           assert after.get('userId'), after
           PY
