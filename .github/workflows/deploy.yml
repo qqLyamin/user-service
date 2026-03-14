@@ -89,7 +89,9 @@ jobs:
             sudo mkdir -p "${{ vars.DEPLOY_PATH }}/shared/env"
             sudo chown -R "${{ vars.DEPLOY_USER }}:${{ vars.DEPLOY_USER }}" "${{ vars.DEPLOY_PATH }}"
 
-            RELEASE_ID="$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+            SHA_SHORT="${{ github.sha }}"
+            SHA_SHORT="${SHA_SHORT:0:7}"
+            RELEASE_ID="$(date +%Y%m%d%H%M%S)-${SHA_SHORT}"
             RELEASE_DIR="${{ vars.DEPLOY_PATH }}/releases/${RELEASE_ID}"
             ENV_FILE="${{ vars.DEPLOY_PATH }}/shared/env/user-service.env"
 
