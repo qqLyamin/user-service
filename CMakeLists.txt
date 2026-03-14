@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(user-service
-    src/main.cpp
+    cmd/user-service/main.cpp
 )
 
 if(MSVC)
@@ -16,4 +16,6 @@ else()
     target_compile_options(user-service PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-target_link_libraries(user-service PRIVATE ws2_32)
+if(WIN32)
+    target_link_libraries(user-service PRIVATE ws2_32)
+endif()

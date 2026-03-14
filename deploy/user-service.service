@@ -1,0 +1,16 @@
+[Unit]
+Description=User Service
+After=network.target
+
+[Service]
+Type=simple
+User=__DEPLOY_USER__
+WorkingDirectory=__DEPLOY_PATH__/current
+EnvironmentFile=__DEPLOY_PATH__/shared/env/user-service.env
+ExecStart=__DEPLOY_PATH__/current/user-service
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

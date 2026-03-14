@@ -1,6 +1,6 @@
 # user-service
 
-MVP user domain service in C++20 with a self-contained HTTP server and no third-party runtime dependencies.
+User domain service in C++20 with a self-contained HTTP server, deploy assets, migration files, and smoke-compatible JWT auth.
 
 ## What is implemented
 
@@ -12,13 +12,15 @@ MVP user domain service in C++20 with a self-contained HTTP server and no third-
 - Internal event ingestion with idempotency via `eventId`
 - User-owned entity projection read model for rooms and conversations
 - Outbox, audit log, and simple counters exposed via internal endpoints
+- `/health` endpoint with DB-aware readiness semantics
+- Lazy profile bootstrap for JWT-driven smoke flow on `GET /v1/users/me`
+- PostgreSQL migration files in `migrations/` and `user-service migrate up|down|status`
+- Deploy assets: `.env.example`, `deploy/user-service.service`, `.github/workflows/deploy.yml`
 
 ## Auth model used in the MVP
 
-- Public endpoints require `Authorization: Bearer user:<user-id>`
+- Public endpoints accept `Authorization: Bearer <jwt>` for smoke/deploy flow and still accept `Authorization: Bearer user:<user-id>` for local/internal development tests
 - Internal endpoints require `X-Internal-Token: internal-secret`
-
-This is only a transport/testing shim. The service does not mint or validate JWTs.
 
 ## Build
 
@@ -27,6 +29,13 @@ This is only a transport/testing shim. The service does not mint or validate JWT
 ```
 
 The repository also contains `CMakeLists.txt`, but the checked-in build script is the deterministic path used for local verification on this machine.
+
+On Linux CI/deploy hosts:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
 
 ## Run
 
@@ -47,6 +56,7 @@ $env:USER_SERVICE_PORT=8080
 
 - `GET /v1/users/me`
 - `PATCH /v1/users/me`
+- `GET /health`
 - `GET /v1/users/{userId}`
 - `POST /v1/users/{userId}/friend-request`
 - `POST /v1/users/{userId}/friend-request/accept`
@@ -102,6 +112,6 @@ Supported `type` values:
 
 ## Design notes
 
-- Storage is in-memory for the MVP executable.
-- Outbox and audit log are process-local read models.
-- The project includes a Python spec test that boots the binary and checks the scenarios end to end.
+- When PostgreSQL env vars are present, deploy/health/migration flow is DB-aware and `migrate up|down|status` is available through the service binary.
+- Local Windows verification still runs against the in-memory path because `psql` is not present in this environment.
+- The repository includes two Python tests: the legacy domain e2e and a JWT smoke-compatible `GET/PATCH/GET /v1/users/me` flow.

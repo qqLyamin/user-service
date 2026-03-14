@@ -1,0 +1,11 @@
+DROP INDEX IF EXISTS user_event_outbox_aggregate_idx;
+DROP INDEX IF EXISTS user_event_outbox_published_created_idx;
+DROP INDEX IF EXISTS user_entity_projection_user_type_idx;
+DROP INDEX IF EXISTS user_entity_projection_unique_idx;
+DROP INDEX IF EXISTS user_blocks_target_idx;
+DROP INDEX IF EXISTS user_blocks_unique_idx;
+DROP INDEX IF EXISTS user_relationships_target_status_idx;
+DROP INDEX IF EXISTS user_relationships_user_status_idx;
+DROP INDEX IF EXISTS user_relationships_unique_idx;
+DROP INDEX IF EXISTS user_profiles_profile_status_idx;
+DROP INDEX IF EXISTS user_profiles_username_uidx;

@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = ROOT / "build"
 EXE = BUILD_DIR / "user-service.exe"
+if not EXE.exists():
+    EXE = BUILD_DIR / "user-service"
 BASE_URL = "http://127.0.0.1:18080"
 INTERNAL_TOKEN = "internal-secret"
 

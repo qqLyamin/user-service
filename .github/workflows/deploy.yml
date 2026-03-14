@@ -1,0 +1,194 @@
+name: CI/CD User Service
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-user-service-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+  SERVICE_PORT: ${{ vars.SERVICE_PORT }}
+  DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+  DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+  DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+  DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+  POSTGRES_HOST: ${{ vars.POSTGRES_HOST }}
+  POSTGRES_PORT: ${{ vars.POSTGRES_PORT }}
+  POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+  POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+  POSTGRES_SSLMODE: ${{ vars.POSTGRES_SSLMODE }}
+  JWT_ISSUER: ${{ vars.JWT_ISSUER }}
+  JWT_AUDIENCE: ${{ vars.JWT_AUDIENCE }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake python3 postgresql-client
+
+      - name: Run tests
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+          python3 tests/spec_test.py
+          python3 tests/jwt_smoke_test.py
+
+      - name: Build binary
+        run: |
+          mkdir -p dist
+          cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux --config Release
+          cp build-linux/user-service dist/user-service
+          chmod +x dist/user-service
+
+      - name: Create release bundle
+        run: |
+          mkdir -p release/deploy
+          cp dist/user-service release/
+          cp .env.example release/.env.example
+          cp deploy/user-service.service release/deploy/user-service.service
+          cp -R migrations release/migrations
+          tar -C release -czf user-service.tar.gz .
+
+      - name: Upload bundle to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ vars.DEPLOY_PORT }}
+          source: "user-service.tar.gz"
+          target: "/tmp"
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ vars.DEPLOY_PORT }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            sudo mkdir -p "${{ vars.DEPLOY_PATH }}/releases"
+            sudo mkdir -p "${{ vars.DEPLOY_PATH }}/shared/env"
+            sudo chown -R "${{ vars.DEPLOY_USER }}:${{ vars.DEPLOY_USER }}" "${{ vars.DEPLOY_PATH }}"
+
+            RELEASE_ID="$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+            RELEASE_DIR="${{ vars.DEPLOY_PATH }}/releases/${RELEASE_ID}"
+            ENV_FILE="${{ vars.DEPLOY_PATH }}/shared/env/user-service.env"
+
+            mkdir -p "$RELEASE_DIR"
+            tar -xzf /tmp/user-service.tar.gz -C "$RELEASE_DIR"
+
+            install -m 600 /dev/null "$ENV_FILE"
+            printf '%s\n' \
+              "HTTP_ADDR=127.0.0.1:${{ vars.SERVICE_PORT }}" \
+              "" \
+              "POSTGRES_HOST=${{ vars.POSTGRES_HOST }}" \
+              "POSTGRES_PORT=${{ vars.POSTGRES_PORT }}" \
+              "POSTGRES_DB=${{ vars.POSTGRES_DB }}" \
+              "POSTGRES_USER=${{ vars.POSTGRES_USER }}" \
+              "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" \
+              "POSTGRES_SSLMODE=${{ vars.POSTGRES_SSLMODE }}" \
+              "" \
+              "JWT_SECRET=${{ secrets.JWT_SECRET }}" \
+              "JWT_ISSUER=${{ vars.JWT_ISSUER }}" \
+              "JWT_AUDIENCE=${{ vars.JWT_AUDIENCE }}" > "$ENV_FILE"
+
+            cp "$RELEASE_DIR/deploy/user-service.service" /tmp/user-service.service
+            sed -i "s|__DEPLOY_USER__|${{ vars.DEPLOY_USER }}|g" /tmp/user-service.service
+            sed -i "s|__DEPLOY_PATH__|${{ vars.DEPLOY_PATH }}|g" /tmp/user-service.service
+            sudo install -m 0644 /tmp/user-service.service /etc/systemd/system/user-service.service
+            rm -f /tmp/user-service.service
+
+            ln -sfn "$RELEASE_DIR" "${{ vars.DEPLOY_PATH }}/current"
+            "${{ vars.DEPLOY_PATH }}/current/user-service" migrate up
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable user-service
+            sudo systemctl restart user-service
+            sleep 2
+            sudo systemctl --no-pager --full status user-service
+
+      - name: Healthcheck
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ vars.DEPLOY_PORT }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            curl -fsS http://127.0.0.1:${{ vars.SERVICE_PORT }}/health
+            curl -k -fsS https://${{ vars.DEPLOY_HOST }}/user/health
+
+      - name: Acceptance smoke test
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' > smoke-token.txt
+          import base64, hashlib, hmac, json, os, time
+          def b64url(data: bytes) -> str:
+              return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+          header = {"alg": "HS256", "typ": "JWT"}
+          payload = {
+              "iss": os.environ["JWT_ISSUER"],
+              "sub": "ci-smoke-user",
+              "uid": "ci-smoke-user",
+              "name": "CI Smoke User",
+              "aud": [os.environ["JWT_AUDIENCE"]],
+              "iat": int(time.time()),
+              "exp": int(time.time()) + 300,
+          }
+          signing_input = f"{b64url(json.dumps(header, separators=(',', ':')).encode())}.{b64url(json.dumps(payload, separators=(',', ':')).encode())}"
+          signature = hmac.new(os.environ["JWT_SECRET"].encode(), signing_input.encode(), hashlib.sha256).digest()
+          print(f"{signing_input}.{b64url(signature)}")
+          PY
+
+          TOKEN="$(cat smoke-token.txt)"
+
+          curl -k -fsS \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "https://${DEPLOY_HOST}/user/v1/users/me" > me-before.json
+
+          curl -k -fsS \
+            -X PATCH \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"displayName":"CI Smoke Updated"}' \
+            "https://${DEPLOY_HOST}/user/v1/users/me" > me-patch.json
+
+          curl -k -fsS \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "https://${DEPLOY_HOST}/user/v1/users/me" > me-after.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          before = json.loads(Path('me-before.json').read_text(encoding='utf-8'))
+          patched = json.loads(Path('me-patch.json').read_text(encoding='utf-8'))
+          after = json.loads(Path('me-after.json').read_text(encoding='utf-8'))
+
+          assert after.get('displayName') == 'CI Smoke Updated', (before, patched, after)
+          assert after.get('userId'), after
+          PY

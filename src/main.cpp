@@ -1,18 +1,30 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -21,6 +33,14 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#ifndef _WIN32
+using SOCKET = int;
+constexpr int INVALID_SOCKET = -1;
+constexpr int SOCKET_ERROR = -1;
+constexpr int SD_BOTH = SHUT_RDWR;
+#define closesocket close
+#endif
 
 namespace {
 
@@ -452,6 +472,463 @@ std::string pair_key(const std::string& lhs, const std::string& rhs) {
     return lhs + "|" + rhs;
 }
 
+std::optional<std::string> get_env(const char* key) {
+#ifdef _WIN32
+    char* value = nullptr;
+    std::size_t size = 0;
+    if (_dupenv_s(&value, &size, key) == 0 && value != nullptr) {
+        std::string result(value);
+        std::free(value);
+        return result;
+    }
+    return std::nullopt;
+#else
+    const char* value = std::getenv(key);
+    if (value == nullptr) {
+        return std::nullopt;
+    }
+    return std::string(value);
+#endif
+}
+
+bool is_uuid_like(const std::string& value) {
+    static const std::regex pattern("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$");
+    return std::regex_match(value, pattern);
+}
+
+std::string hash_to_uuid(const std::string& value) {
+    std::uint64_t h1 = 1469598103934665603ULL;
+    std::uint64_t h2 = 1099511628211ULL;
+    for (unsigned char ch : value) {
+        h1 ^= ch;
+        h1 *= 1099511628211ULL;
+        h2 += ch + 0x9e3779b97f4a7c15ULL + (h2 << 6U) + (h2 >> 2U);
+    }
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0')
+        << std::setw(8) << static_cast<std::uint32_t>(h1 >> 32U) << "-"
+        << std::setw(4) << static_cast<std::uint16_t>((h1 >> 16U) & 0xffffU) << "-"
+        << std::setw(4) << static_cast<std::uint16_t>((h1 & 0x0fffU) | 0x4000U) << "-"
+        << std::setw(4) << static_cast<std::uint16_t>((h2 & 0x3fffU) | 0x8000U) << "-"
+        << std::setw(12) << (h2 & 0xffffffffffffULL);
+    return oss.str();
+}
+
+std::string canonical_user_id(const std::string& raw_user_id) {
+    return is_uuid_like(raw_user_id) ? to_lower(raw_user_id) : hash_to_uuid(raw_user_id);
+}
+
+std::string shell_escape_single_quotes(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() * 2U);
+    for (char ch : value) {
+        if (ch == '\'') {
+            escaped += "''";
+        } else {
+            escaped.push_back(ch);
+        }
+    }
+    return escaped;
+}
+
+struct ExecResult {
+    int exit_code = 0;
+    std::string output;
+};
+
+ExecResult run_command_capture(const std::string& command) {
+    ExecResult result;
+#ifdef _WIN32
+    FILE* pipe = _popen(command.c_str(), "r");
+#else
+    FILE* pipe = popen(command.c_str(), "r");
+#endif
+    if (pipe == nullptr) {
+        result.exit_code = 1;
+        result.output = "failed to spawn command";
+        return result;
+    }
+    char buffer[512];
+    while (std::fgets(buffer, static_cast<int>(sizeof(buffer)), pipe) != nullptr) {
+        result.output += buffer;
+    }
+#ifdef _WIN32
+    result.exit_code = _pclose(pipe);
+#else
+    result.exit_code = pclose(pipe);
+#endif
+    return result;
+}
+
+std::string base64url_decode(std::string input) {
+    std::replace(input.begin(), input.end(), '-', '+');
+    std::replace(input.begin(), input.end(), '_', '/');
+    while ((input.size() % 4U) != 0U) {
+        input.push_back('=');
+    }
+    static const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    int val = 0;
+    int valb = -8;
+    for (unsigned char ch : input) {
+        if (std::isspace(ch) != 0 || ch == '=') {
+            continue;
+        }
+        const auto pos = alphabet.find(static_cast<char>(ch));
+        if (pos == std::string::npos) {
+            throw std::runtime_error("Invalid base64url input");
+        }
+        val = (val << 6) + static_cast<int>(pos);
+        valb += 6;
+        if (valb >= 0) {
+            output.push_back(static_cast<char>((val >> valb) & 0xff));
+            valb -= 8;
+        }
+    }
+    return output;
+}
+
+struct JwtPrincipal {
+    std::string raw_user_id;
+    std::string canonical_id;
+    std::optional<std::string> display_name;
+};
+
+JwtPrincipal parse_jwt_without_signature_validation(
+    const std::string& token,
+    const std::optional<std::string>& required_issuer,
+    const std::optional<std::string>& required_audience) {
+    std::stringstream ss(token);
+    std::string header_part;
+    std::string payload_part;
+    std::string signature_part;
+    std::getline(ss, header_part, '.');
+    std::getline(ss, payload_part, '.');
+    std::getline(ss, signature_part, '.');
+    if (header_part.empty() || payload_part.empty()) {
+        throw std::runtime_error("Malformed JWT");
+    }
+    const auto header = require_object(JsonParser(base64url_decode(header_part)).parse());
+    const auto payload = require_object(JsonParser(base64url_decode(payload_part)).parse());
+    if (header.count("typ") != 0 && header.at("typ").is_string() && to_lower(header.at("typ").as_string()) != "jwt") {
+        throw std::runtime_error("Unsupported JWT typ");
+    }
+    if (required_issuer.has_value()) {
+        const auto issuer = required_string(payload, "iss");
+        if (issuer != *required_issuer) {
+            throw std::runtime_error("JWT issuer mismatch");
+        }
+    }
+    if (required_audience.has_value()) {
+        bool audience_ok = false;
+        const auto it = payload.find("aud");
+        if (it != payload.end()) {
+            if (it->second.is_string()) {
+                audience_ok = it->second.as_string() == *required_audience;
+            } else if (it->second.is_array()) {
+                for (const auto& entry : it->second.as_array()) {
+                    if (entry.is_string() && entry.as_string() == *required_audience) {
+                        audience_ok = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!audience_ok) {
+            throw std::runtime_error("JWT audience mismatch");
+        }
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();
+    if (payload.count("exp") != 0 && payload.at("exp").is_number() && static_cast<long long>(payload.at("exp").as_number()) < now) {
+        throw std::runtime_error("JWT expired");
+    }
+    const std::string raw_user_id = optional_string(payload, "uid").value_or(required_string(payload, "sub"));
+    return JwtPrincipal{
+        .raw_user_id = raw_user_id,
+        .canonical_id = canonical_user_id(raw_user_id),
+        .display_name = optional_string(payload, "name"),
+    };
+}
+
+struct DbConfig {
+    std::string host;
+    std::string port;
+    std::string name;
+    std::string user;
+    std::string password;
+    std::string sslmode;
+};
+
+class PostgresPsqlAdapter {
+public:
+    PostgresPsqlAdapter() {
+        auto host = get_env("POSTGRES_HOST");
+        auto port = get_env("POSTGRES_PORT");
+        auto name = get_env("POSTGRES_DB");
+        auto user = get_env("POSTGRES_USER");
+        auto password = get_env("POSTGRES_PASSWORD");
+        auto sslmode = get_env("POSTGRES_SSLMODE");
+        enabled_ = host.has_value() && port.has_value() && name.has_value() && user.has_value() && password.has_value() && sslmode.has_value();
+        if (enabled_) {
+            config_ = DbConfig{*host, *port, *name, *user, *password, *sslmode};
+        }
+    }
+
+    bool enabled() const {
+        return enabled_;
+    }
+
+    bool ready() const {
+        if (!enabled_) {
+            return false;
+        }
+        const auto result = query_scalar(
+            "SELECT COUNT(*)::text FROM information_schema.tables "
+            "WHERE table_schema='public' AND table_name IN ("
+            "'user_profiles','user_privacy_settings','user_relationships','user_blocks','user_entity_projection','user_event_outbox');");
+        return result.has_value() && *result == "6";
+    }
+
+    std::optional<JsonObject> get_profile(const std::string& user_id) const {
+        if (!enabled_) {
+            return std::nullopt;
+        }
+        const std::string sql =
+            "SELECT user_id::text, display_name, COALESCE(username,''), COALESCE(avatar_object_id,''), "
+            "COALESCE(bio,''), COALESCE(locale,''), COALESCE(time_zone,''), profile_status, "
+            "to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
+            "to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
+            "COALESCE(to_char(deleted_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),'') "
+            "FROM user_profiles WHERE user_id='" + shell_escape_single_quotes(user_id) + "';";
+        const auto result = query_rows(sql);
+        if (!result.has_value() || result->empty()) {
+            return std::nullopt;
+        }
+        const auto& columns = result->front();
+        if (columns.size() != 11U) {
+            throw std::runtime_error("Unexpected profile row shape");
+        }
+        return JsonObject{
+            {"userId", columns[0]},
+            {"displayName", columns[1]},
+            {"username", columns[2].empty() ? Json(nullptr) : Json(columns[2])},
+            {"avatarObjectId", columns[3].empty() ? Json(nullptr) : Json(columns[3])},
+            {"bio", columns[4].empty() ? Json(nullptr) : Json(columns[4])},
+            {"locale", columns[5].empty() ? Json(nullptr) : Json(columns[5])},
+            {"timeZone", columns[6].empty() ? Json(nullptr) : Json(columns[6])},
+            {"profileStatus", columns[7]},
+            {"createdAt", columns[8]},
+            {"updatedAt", columns[9]},
+            {"deletedAt", columns[10].empty() ? Json(nullptr) : Json(columns[10])},
+        };
+    }
+
+    void ensure_profile_exists(const std::string& user_id, const std::string& display_name) const {
+        if (!enabled_) {
+            return;
+        }
+        const std::string escaped_user_id = shell_escape_single_quotes(user_id);
+        const std::string escaped_display_name = shell_escape_single_quotes(display_name);
+        const std::string sql =
+            "BEGIN;"
+            "INSERT INTO user_profiles (user_id, display_name, username, avatar_object_id, bio, locale, time_zone, profile_status, created_at, updated_at, deleted_at) "
+            "VALUES ('" + escaped_user_id + "','" + escaped_display_name + "',NULL,NULL,NULL,NULL,NULL,'active',NOW(),NOW(),NULL) "
+            "ON CONFLICT (user_id) DO NOTHING;"
+            "INSERT INTO user_privacy_settings (user_id, profile_visibility, dm_policy, friend_request_policy, last_seen_visibility, avatar_visibility, created_at, updated_at) "
+            "VALUES ('" + escaped_user_id + "','public','everyone','everyone','public','public',NOW(),NOW()) "
+            "ON CONFLICT (user_id) DO NOTHING;"
+            "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) "
+            "VALUES ('" + shell_escape_single_quotes(hash_to_uuid("profile-created-" + user_id + now_iso8601())) + "','user_profile','" + escaped_user_id + "','user.profile_created',"
+            "'{\"userId\":\"" + escaped_user_id + "\"}'::jsonb,NOW(),NULL);"
+            "COMMIT;";
+        exec_sql(sql);
+    }
+
+    void patch_profile(const std::string& user_id, const JsonObject& patch) const {
+        if (!enabled_) {
+            return;
+        }
+        std::vector<std::string> assignments;
+        if (const auto value = optional_string(patch, "displayName")) {
+            assignments.push_back("display_name='" + shell_escape_single_quotes(*value) + "'");
+        }
+        if (patch.count("username") != 0) {
+            if (patch.at("username").is_null()) {
+                assignments.push_back("username=NULL");
+            } else {
+                assignments.push_back("username='" + shell_escape_single_quotes(required_string(patch, "username")) + "'");
+            }
+        }
+        if (patch.count("avatarObjectId") != 0) {
+            if (patch.at("avatarObjectId").is_null()) {
+                assignments.push_back("avatar_object_id=NULL");
+            } else {
+                assignments.push_back("avatar_object_id='" + shell_escape_single_quotes(required_string(patch, "avatarObjectId")) + "'");
+            }
+        }
+        for (const auto field : {"bio", "locale", "timeZone"}) {
+            if (patch.count(field) != 0) {
+                const std::string column = std::string(field == std::string("timeZone") ? "time_zone" : to_lower(field));
+                if (patch.at(field).is_null()) {
+                    assignments.push_back(column + "=NULL");
+                } else {
+                    assignments.push_back(column + "='" + shell_escape_single_quotes(required_string(patch, field)) + "'");
+                }
+            }
+        }
+        if (assignments.empty()) {
+            return;
+        }
+        assignments.push_back("updated_at=NOW()");
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "UPDATE user_profiles SET ";
+        for (std::size_t i = 0; i < assignments.size(); ++i) {
+            if (i != 0U) {
+                sql << ",";
+            }
+            sql << assignments[i];
+        }
+        sql << " WHERE user_id='" << shell_escape_single_quotes(user_id) << "';";
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES (";
+        sql << "'" << shell_escape_single_quotes(hash_to_uuid("profile-updated-" + user_id + now_iso8601())) << "','user_profile','"
+            << shell_escape_single_quotes(user_id) << "','user.profile_updated','{\"userId\":\""
+            << shell_escape_single_quotes(user_id) << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+    }
+
+    int migrate_up(const std::string& migrations_dir) const;
+    int migrate_down(const std::string& migrations_dir) const;
+    int migrate_status(const std::string& migrations_dir) const;
+
+private:
+    bool enabled_ = false;
+    std::optional<DbConfig> config_;
+
+    std::string psql_command_prefix() const {
+        const auto& cfg = *config_;
+        return "PGPASSWORD='" + shell_escape_single_quotes(cfg.password) + "' psql -X -v ON_ERROR_STOP=1 -h '" + shell_escape_single_quotes(cfg.host) +
+               "' -p '" + shell_escape_single_quotes(cfg.port) + "' -U '" + shell_escape_single_quotes(cfg.user) +
+               "' -d '" + shell_escape_single_quotes(cfg.name) + "' ";
+    }
+
+    void exec_sql(const std::string& sql) const {
+        const auto result = run_command_capture(psql_command_prefix() + "-q -c \"" + sql + "\" 2>&1");
+        if (result.exit_code != 0) {
+            throw std::runtime_error("psql exec failed: " + result.output);
+        }
+    }
+
+    std::optional<std::string> query_scalar(const std::string& sql) const {
+        const auto rows = query_rows(sql);
+        if (!rows.has_value() || rows->empty() || rows->front().empty()) {
+            return std::nullopt;
+        }
+        return rows->front().front();
+    }
+
+    std::optional<std::vector<std::vector<std::string>>> query_rows(const std::string& sql) const {
+        const auto result = run_command_capture(psql_command_prefix() + "-At -F '|' -c \"" + sql + "\" 2>&1");
+        if (result.exit_code != 0) {
+            throw std::runtime_error("psql query failed: " + result.output);
+        }
+        std::vector<std::vector<std::string>> rows;
+        std::stringstream ss(result.output);
+        std::string line;
+        while (std::getline(ss, line)) {
+            line = trim(line);
+            if (line.empty()) {
+                continue;
+            }
+            std::vector<std::string> columns;
+            std::stringstream line_stream(line);
+            std::string cell;
+            while (std::getline(line_stream, cell, '|')) {
+                columns.push_back(cell);
+            }
+            rows.push_back(columns);
+        }
+        return rows;
+    }
+};
+
+std::vector<std::filesystem::path> list_migration_files(const std::string& migrations_dir, const std::string& suffix) {
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(migrations_dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().filename().string().ends_with(suffix)) {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+std::string read_file_text(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        throw std::runtime_error("Cannot open file: " + path.string());
+    }
+    std::ostringstream buffer;
+    buffer << stream.rdbuf();
+    return buffer.str();
+}
+
+int PostgresPsqlAdapter::migrate_up(const std::string& migrations_dir) const {
+    if (!enabled_) {
+        throw std::runtime_error("Database env is not configured");
+    }
+    exec_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT NOW());");
+    for (const auto& file : list_migration_files(migrations_dir, ".up.sql")) {
+        const auto version = file.filename().string().substr(0, 4);
+        if (query_scalar("SELECT version FROM schema_migrations WHERE version='" + version + "';").has_value()) {
+            continue;
+        }
+        exec_sql("BEGIN;" + read_file_text(file) + "INSERT INTO schema_migrations(version, applied_at) VALUES ('" + version + "', NOW());COMMIT;");
+    }
+    return 0;
+}
+
+int PostgresPsqlAdapter::migrate_down(const std::string& migrations_dir) const {
+    if (!enabled_) {
+        throw std::runtime_error("Database env is not configured");
+    }
+    exec_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT NOW());");
+    const auto current = query_scalar("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1;");
+    if (!current.has_value()) {
+        std::cout << "No migrations applied\n";
+        return 0;
+    }
+    std::filesystem::path path;
+    for (const auto& candidate : list_migration_files(migrations_dir, ".down.sql")) {
+        if (candidate.filename().string().rfind(*current + "_", 0) == 0) {
+            path = candidate;
+            break;
+        }
+    }
+    if (path.empty()) {
+        throw std::runtime_error("Down migration file not found for version " + *current);
+    }
+    exec_sql("BEGIN;" + read_file_text(path) + "DELETE FROM schema_migrations WHERE version='" + *current + "';COMMIT;");
+    return 0;
+}
+
+int PostgresPsqlAdapter::migrate_status(const std::string& migrations_dir) const {
+    if (!enabled_) {
+        throw std::runtime_error("Database env is not configured");
+    }
+    exec_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT NOW());");
+    for (const auto& file : list_migration_files(migrations_dir, ".up.sql")) {
+        const auto version = file.filename().string().substr(0, 4);
+        const bool applied = query_scalar("SELECT version FROM schema_migrations WHERE version='" + version + "';").has_value();
+        std::cout << version << " " << (applied ? "up" : "pending") << "\n";
+    }
+    return 0;
+}
+
 class ServiceState {
 public:
     Response handle(const Request& request) {
@@ -465,6 +942,9 @@ public:
 
 private:
     std::mutex mutex_;
+    PostgresPsqlAdapter db_;
+    std::optional<std::string> jwt_issuer_ = get_env("JWT_ISSUER");
+    std::optional<std::string> jwt_audience_ = get_env("JWT_AUDIENCE");
     std::unordered_map<std::string, UserProfile> profiles_;
     std::unordered_map<std::string, PrivacySettings> privacy_;
     std::unordered_map<std::string, RelationshipRecord> relationships_;
@@ -479,6 +959,21 @@ private:
     Response route(const Request& request) {
         if (request.method == "GET" && request.path == "/healthz") {
             return json_response(200, JsonObject{{"status", "ok"}});
+        }
+        if (request.method == "GET" && request.path == "/health") {
+            if (db_.enabled()) {
+                bool ready = false;
+                try {
+                    ready = db_.ready();
+                } catch (const std::exception& ex) {
+                    return json_response(503, JsonObject{{"status", "degraded"}, {"ready", false}, {"message", ex.what()}});
+                }
+                if (!ready) {
+                    return json_response(503, JsonObject{{"status", "degraded"}, {"ready", false}});
+                }
+                return json_response(200, JsonObject{{"status", "ok"}, {"ready", true}, {"storage", "postgres"}});
+            }
+            return json_response(200, JsonObject{{"status", "ok"}, {"ready", true}, {"storage", "memory"}});
         }
         if (request.method == "GET" && request.path == "/internal/metrics") {
             return internal_metrics(request);
@@ -598,10 +1093,29 @@ private:
         const std::string raw_header = trim(it->second);
         const std::string prefix = "bearer user:";
         const std::string header = to_lower(raw_header);
-        if (header.rfind(prefix, 0) != 0) {
-            throw std::runtime_error("Expected Authorization: Bearer user:<user-id>");
+        if (header.rfind(prefix, 0) == 0) {
+            return trim(raw_header.substr(prefix.size()));
         }
-        return trim(raw_header.substr(prefix.size()));
+        const std::string bearer_prefix = "bearer ";
+        if (header.rfind(bearer_prefix, 0) != 0) {
+            throw std::runtime_error("Expected Authorization: Bearer <jwt> or Bearer user:<user-id>");
+        }
+        const auto principal = parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_);
+        return principal.canonical_id;
+    }
+
+    std::optional<std::string> actor_display_name_from_jwt(const Request& request) const {
+        const auto it = request.headers.find("authorization");
+        if (it == request.headers.end()) {
+            return std::nullopt;
+        }
+        const std::string raw_header = trim(it->second);
+        const std::string bearer_prefix = "bearer ";
+        const std::string header = to_lower(raw_header);
+        if (header.rfind(bearer_prefix, 0) != 0 || header.rfind("bearer user:", 0) == 0) {
+            return std::nullopt;
+        }
+        return parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_).display_name;
     }
 
     void require_internal_token(const Request& request) const {
@@ -641,6 +1155,36 @@ private:
             throw std::runtime_error("User privacy settings not found: " + user_id);
         }
         return it->second;
+    }
+
+    JsonObject ensure_db_profile_exists_and_load(const std::string& user_id, const std::optional<std::string>& preferred_display_name) {
+        db_.ensure_profile_exists(user_id, preferred_display_name.value_or("User " + user_id.substr(0, std::min<std::size_t>(8, user_id.size()))));
+        const auto profile = db_.get_profile(user_id);
+        if (!profile.has_value()) {
+            throw std::runtime_error("Failed to load DB profile after ensure");
+        }
+        return *profile;
+    }
+
+    UserProfile& ensure_memory_profile_exists(const std::string& user_id, const std::optional<std::string>& preferred_display_name) {
+        auto it = profiles_.find(user_id);
+        if (it != profiles_.end()) {
+            return it->second;
+        }
+        const auto timestamp = now_iso8601();
+        UserProfile profile;
+        profile.user_id = user_id;
+        profile.display_name = preferred_display_name.value_or("User " + user_id.substr(0, std::min<std::size_t>(8, user_id.size())));
+        profile.created_at = timestamp;
+        profile.updated_at = timestamp;
+        profiles_[user_id] = profile;
+
+        PrivacySettings settings;
+        settings.user_id = user_id;
+        settings.created_at = timestamp;
+        settings.updated_at = timestamp;
+        privacy_[user_id] = settings;
+        return profiles_.at(user_id);
     }
 
     bool has_block(const std::string& user_id, const std::string& target_user_id) const {
@@ -1013,6 +1557,18 @@ private:
     Response internal_get_profile(const Request& request) {
         require_internal_token(request);
         const auto user_id = extract_user_id_from_internal_path(request.path, "/profile");
+        if (db_.enabled()) {
+            const auto profile = db_.get_profile(user_id);
+            if (!profile.has_value()) {
+                return error_response(404, "not_found", "User profile not found");
+            }
+            return json_response(200, JsonObject{
+                {"userId", profile->at("userId")},
+                {"displayName", profile->at("displayName")},
+                {"avatarObjectId", profile->at("avatarObjectId")},
+                {"profileStatus", profile->at("profileStatus")},
+            });
+        }
         const auto& profile = require_profile_const(user_id);
         return json_response(200, JsonObject{
             {"userId", profile.user_id},
@@ -1081,16 +1637,35 @@ private:
 
     Response get_me(const Request& request) {
         const auto actor_user_id = require_actor_user_id(request);
-        const auto& profile = require_profile_const(actor_user_id);
+        const auto preferred_display_name = actor_display_name_from_jwt(request);
+        if (db_.enabled()) {
+            increment_metric("profile.read.self");
+            return json_response(200, ensure_db_profile_exists_and_load(actor_user_id, preferred_display_name));
+        }
+        const auto& profile = ensure_memory_profile_exists(actor_user_id, preferred_display_name);
         increment_metric("profile.read.self");
         return json_response(200, profile_to_json(profile, true));
     }
 
     Response patch_me(const Request& request) {
         const auto actor_user_id = require_actor_user_id(request);
-        auto& profile = require_profile(actor_user_id);
+        const auto preferred_display_name = actor_display_name_from_jwt(request);
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
+        if (db_.enabled()) {
+            if (const auto display_name = optional_string(object, "displayName")) {
+                validate_display_name(*display_name);
+            }
+            if (const auto username = optional_string(object, "username")) {
+                validate_username(*username);
+            }
+            db_.ensure_profile_exists(actor_user_id, preferred_display_name.value_or("User " + actor_user_id.substr(0, std::min<std::size_t>(8, actor_user_id.size()))));
+            db_.patch_profile(actor_user_id, object);
+            increment_metric("profile.updated");
+            audit("profile.update", actor_user_id, actor_user_id);
+            return json_response(200, ensure_db_profile_exists_and_load(actor_user_id, preferred_display_name));
+        }
+        auto& profile = ensure_memory_profile_exists(actor_user_id, preferred_display_name);
 
         if (const auto display_name = optional_string(object, "displayName")) {
             validate_display_name(*display_name);
@@ -1407,6 +1982,7 @@ std::string status_text(int status) {
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 409: return "Conflict";
+        case 503: return "Service Unavailable";
         default: return "OK";
     }
 }
@@ -1473,21 +2049,30 @@ std::string receive_http_request(SOCKET client_socket) {
 }
 
 int run_server(unsigned short port) {
+#ifdef _WIN32
     WSADATA wsa_data{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
         std::cerr << "WSAStartup failed\n";
         return 1;
     }
+#endif
 
     SOCKET server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (server_socket == INVALID_SOCKET) {
         std::cerr << "socket() failed\n";
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
+#ifdef _WIN32
     BOOL opt = TRUE;
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+#else
+    int opt = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -1497,13 +2082,17 @@ int run_server(unsigned short port) {
     if (bind(server_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
         std::cerr << "bind() failed\n";
         closesocket(server_socket);
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
     if (listen(server_socket, SOMAXCONN) == SOCKET_ERROR) {
         std::cerr << "listen() failed\n";
         closesocket(server_socket);
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -1533,12 +2122,30 @@ int run_server(unsigned short port) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc >= 3 && std::string(argv[1]) == "migrate") {
+        const auto base_dir = std::filesystem::current_path();
+        const auto migrations_dir = (base_dir / "migrations").string();
+        PostgresPsqlAdapter db;
+        if (std::string(argv[2]) == "up") {
+            return db.migrate_up(migrations_dir);
+        }
+        if (std::string(argv[2]) == "down") {
+            return db.migrate_down(migrations_dir);
+        }
+        if (std::string(argv[2]) == "status") {
+            return db.migrate_status(migrations_dir);
+        }
+        std::cerr << "Unknown migrate command\n";
+        return 1;
+    }
     unsigned short port = 8080;
-    char* env_port = nullptr;
-    std::size_t env_port_size = 0;
-    if (_dupenv_s(&env_port, &env_port_size, "USER_SERVICE_PORT") == 0 && env_port != nullptr) {
-        port = static_cast<unsigned short>(std::stoi(env_port));
-        std::free(env_port);
+    if (const auto env_port = get_env("USER_SERVICE_PORT")) {
+        port = static_cast<unsigned short>(std::stoi(*env_port));
+    } else if (const auto http_addr = get_env("HTTP_ADDR")) {
+        const auto colon = http_addr->rfind(':');
+        if (colon != std::string::npos) {
+            port = static_cast<unsigned short>(std::stoi(http_addr->substr(colon + 1)));
+        }
     } else if (argc > 1) {
         port = static_cast<unsigned short>(std::stoi(argv[1]));
     }
