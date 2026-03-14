@@ -123,7 +123,8 @@ jobs:
             set -a
             . "$ENV_FILE"
             set +a
-            "${{ vars.DEPLOY_PATH }}/current/user-service" migrate up
+            cd "${{ vars.DEPLOY_PATH }}/current"
+            ./user-service migrate up
 
             sudo systemctl daemon-reload
             sudo systemctl enable user-service
