@@ -14,6 +14,7 @@ if(MSVC)
     target_compile_options(user-service PRIVATE /W4 /EHsc)
 else()
     target_compile_options(user-service PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_options(user-service PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
 if(WIN32)
