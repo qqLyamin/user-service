@@ -560,6 +560,25 @@ ExecResult run_command_capture(const std::string& command) {
     return result;
 }
 
+std::filesystem::path write_temp_sql_file(const std::string& sql) {
+    const auto temp_dir = std::filesystem::temp_directory_path();
+    std::string stamp = now_iso8601();
+    for (char& ch : stamp) {
+        if (!(std::isalnum(static_cast<unsigned char>(ch)) != 0)) {
+            ch = '_';
+        }
+    }
+    const auto filename = "user-service-" + stamp + "-" + std::to_string(std::rand()) + ".sql";
+    const auto path = temp_dir / filename;
+    std::ofstream stream(path, std::ios::binary);
+    if (!stream) {
+        throw std::runtime_error("Failed to create temp SQL file");
+    }
+    stream << sql;
+    stream.close();
+    return path;
+}
+
 std::string base64url_decode(std::string input) {
     std::replace(input.begin(), input.end(), '-', '+');
     std::replace(input.begin(), input.end(), '_', '/');
@@ -814,7 +833,10 @@ private:
     }
 
     void exec_sql(const std::string& sql) const {
-        const auto result = run_command_capture(psql_command_prefix() + "-q -c \"" + sql + "\" 2>&1");
+        const auto temp_file = write_temp_sql_file(sql);
+        const auto result = run_command_capture(psql_command_prefix() + "-q -f '" + shell_escape_single_quotes(temp_file.string()) + "' 2>&1");
+        std::error_code ec;
+        std::filesystem::remove(temp_file, ec);
         if (result.exit_code != 0) {
             throw std::runtime_error("psql exec failed: " + result.output);
         }
@@ -829,7 +851,10 @@ private:
     }
 
     std::optional<std::vector<std::vector<std::string>>> query_rows(const std::string& sql) const {
-        const auto result = run_command_capture(psql_command_prefix() + "-At -F '|' -c \"" + sql + "\" 2>&1");
+        const auto temp_file = write_temp_sql_file(sql);
+        const auto result = run_command_capture(psql_command_prefix() + "-At -F '|' -f '" + shell_escape_single_quotes(temp_file.string()) + "' 2>&1");
+        std::error_code ec;
+        std::filesystem::remove(temp_file, ec);
         if (result.exit_code != 0) {
             throw std::runtime_error("psql query failed: " + result.output);
         }
