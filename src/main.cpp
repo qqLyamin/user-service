@@ -867,10 +867,15 @@ private:
                 continue;
             }
             std::vector<std::string> columns;
-            std::stringstream line_stream(line);
-            std::string cell;
-            while (std::getline(line_stream, cell, '|')) {
-                columns.push_back(cell);
+            std::size_t start = 0;
+            while (true) {
+                const auto pos = line.find('|', start);
+                if (pos == std::string::npos) {
+                    columns.push_back(line.substr(start));
+                    break;
+                }
+                columns.push_back(line.substr(start, pos - start));
+                start = pos + 1;
             }
             rows.push_back(columns);
         }
