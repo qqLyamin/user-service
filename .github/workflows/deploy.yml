@@ -120,6 +120,9 @@ jobs:
             rm -f /tmp/user-service.service
 
             ln -sfn "$RELEASE_DIR" "${{ vars.DEPLOY_PATH }}/current"
+            set -a
+            . "$ENV_FILE"
+            set +a
             "${{ vars.DEPLOY_PATH }}/current/user-service" migrate up
 
             sudo systemctl daemon-reload
