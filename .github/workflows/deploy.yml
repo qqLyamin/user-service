@@ -16,6 +16,7 @@ env:
   SERVICE_NAME: ${{ vars.SERVICE_NAME }}
   SERVICE_PORT: ${{ vars.SERVICE_PORT }}
   DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+  PUBLIC_BASE_HOST: ${{ vars.PUBLIC_BASE_HOST }}
   DEPLOY_USER: ${{ vars.DEPLOY_USER }}
   DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
   DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
@@ -143,7 +144,7 @@ jobs:
           script: |
             set -euo pipefail
             curl -fsS http://127.0.0.1:${{ vars.SERVICE_PORT }}/health
-            curl -k -fsS https://${{ vars.DEPLOY_HOST }}/user/health
+            curl -fsS https://${{ vars.PUBLIC_BASE_HOST }}/user/health
 
       - name: Acceptance smoke test
         env:
@@ -177,7 +178,7 @@ jobs:
           signing_input = f"{b64url(json.dumps(header, separators=(',', ':')).encode())}.{b64url(json.dumps(payload, separators=(',', ':')).encode())}"
           signature = hmac.new(os.environ["JWT_SECRET"].encode(), signing_input.encode(), hashlib.sha256).digest()
           token = f"{signing_input}.{b64url(signature)}"
-          base_url = f"https://{os.environ['DEPLOY_HOST']}/user"
+          base_url = f"https://{os.environ['PUBLIC_BASE_HOST']}/user"
           headers = {"Authorization": f"Bearer {token}"}
 
           def call(method: str, path: str, body=None):
