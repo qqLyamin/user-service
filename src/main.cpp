@@ -801,6 +801,48 @@ public:
         return query_scalar(sql).has_value();
     }
 
+    void patch_privacy_settings(const std::string& user_id, const JsonObject& patch) const {
+        if (!enabled_) {
+            return;
+        }
+        std::vector<std::string> assignments;
+        if (const auto value = optional_string(patch, "profileVisibility")) {
+            assignments.push_back("profile_visibility='" + shell_escape_single_quotes(*value) + "'");
+        }
+        if (const auto value = optional_string(patch, "dmPolicy")) {
+            assignments.push_back("dm_policy='" + shell_escape_single_quotes(*value) + "'");
+        }
+        if (const auto value = optional_string(patch, "friendRequestPolicy")) {
+            assignments.push_back("friend_request_policy='" + shell_escape_single_quotes(*value) + "'");
+        }
+        if (const auto value = optional_string(patch, "lastSeenVisibility")) {
+            assignments.push_back("last_seen_visibility='" + shell_escape_single_quotes(*value) + "'");
+        }
+        if (const auto value = optional_string(patch, "avatarVisibility")) {
+            assignments.push_back("avatar_visibility='" + shell_escape_single_quotes(*value) + "'");
+        }
+        if (assignments.empty()) {
+            return;
+        }
+        assignments.push_back("updated_at=NOW()");
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "UPDATE user_privacy_settings SET ";
+        for (std::size_t i = 0; i < assignments.size(); ++i) {
+            if (i != 0U) {
+                sql << ",";
+            }
+            sql << assignments[i];
+        }
+        sql << " WHERE user_id='" << shell_escape_single_quotes(user_id) << "';";
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES (";
+        sql << "'" << shell_escape_single_quotes(hash_to_uuid("privacy-updated-" + user_id + now_iso8601())) << "','user_privacy','"
+            << shell_escape_single_quotes(user_id) << "','user.privacy_updated','{\"userId\":\""
+            << shell_escape_single_quotes(user_id) << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+    }
+
     void ensure_profile_exists(const std::string& user_id, const std::string& display_name) const {
         if (!enabled_) {
             return;
@@ -1554,6 +1596,12 @@ private:
     }
 
     void ensure_profile_exists(const std::string& user_id) const {
+        if (db_.enabled()) {
+            if (db_.get_profile(user_id).has_value()) {
+                return;
+            }
+            throw std::runtime_error("Unknown userId: " + user_id);
+        }
         if (!profiles_.count(user_id)) {
             throw std::runtime_error("Unknown userId: " + user_id);
         }
@@ -1756,13 +1804,8 @@ private:
         const std::string target_user_id = required_string(object, "targetUserId");
         const std::string action = required_string(object, "action");
 
-        if (db_.enabled()) {
-            db_.ensure_profile_exists(actor_user_id, "User " + actor_user_id.substr(0, std::min<std::size_t>(8, actor_user_id.size())));
-            db_.ensure_profile_exists(target_user_id, "User " + target_user_id.substr(0, std::min<std::size_t>(8, target_user_id.size())));
-        } else {
-            ensure_profile_exists(actor_user_id);
-            ensure_profile_exists(target_user_id);
-        }
+        ensure_profile_exists(actor_user_id);
+        ensure_profile_exists(target_user_id);
 
         bool allowed = false;
         std::string reason;
@@ -1803,14 +1846,9 @@ private:
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
         const std::string actor_user_id = required_string(object, "actorUserId");
-        if (db_.enabled()) {
-            db_.ensure_profile_exists(actor_user_id, "User " + actor_user_id.substr(0, std::min<std::size_t>(8, actor_user_id.size())));
-            db_.ensure_profile_exists(user_id, "User " + user_id.substr(0, std::min<std::size_t>(8, user_id.size())));
-            return json_response(200, JsonObject{{"allowed", authorize_profile_read_db(actor_user_id, user_id)}});
-        }
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(user_id);
-        return json_response(200, JsonObject{{"allowed", authorize_profile_read(actor_user_id, user_id)}});
+        return json_response(200, JsonObject{{"allowed", db_.enabled() ? Json(authorize_profile_read_db(actor_user_id, user_id)) : Json(authorize_profile_read(actor_user_id, user_id))}});
     }
 
     Response get_me(const Request& request) {
@@ -1873,6 +1911,14 @@ private:
     Response get_user_by_id(const Request& request, const std::string& user_id) {
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
+        ensure_profile_exists(user_id);
+        if (db_.enabled()) {
+            if (!authorize_profile_read_db(actor_user_id, user_id)) {
+                return error_response(403, "forbidden", "Profile visibility denied");
+            }
+            increment_metric("profile.read.other");
+            return json_response(200, ensure_db_profile_exists_and_load(user_id, std::nullopt));
+        }
         const auto& profile = require_profile_const(user_id);
         if (!authorize_profile_read(actor_user_id, user_id)) {
             return error_response(403, "forbidden", "Profile visibility denied");
@@ -1883,6 +1929,10 @@ private:
 
     Response get_my_privacy(const Request& request) {
         const auto actor_user_id = require_actor_user_id(request);
+        if (db_.enabled()) {
+            increment_metric("privacy.read");
+            return json_response(200, ensure_db_privacy_exists_and_load(actor_user_id));
+        }
         const auto& settings = require_privacy_const(actor_user_id);
         increment_metric("privacy.read");
         return json_response(200, privacy_to_json(settings));
@@ -1890,9 +1940,32 @@ private:
 
     Response patch_my_privacy(const Request& request) {
         const auto actor_user_id = require_actor_user_id(request);
-        auto& settings = require_privacy(actor_user_id);
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
+        if (db_.enabled()) {
+            if (const auto value = optional_string(object, "profileVisibility")) {
+                validate_profile_visibility(*value);
+            }
+            if (const auto value = optional_string(object, "dmPolicy")) {
+                validate_dm_policy(*value);
+            }
+            if (const auto value = optional_string(object, "friendRequestPolicy")) {
+                validate_friend_request_policy(*value);
+            }
+            if (const auto value = optional_string(object, "lastSeenVisibility")) {
+                validate_last_seen_visibility(*value);
+            }
+            if (const auto value = optional_string(object, "avatarVisibility")) {
+                validate_avatar_visibility(*value);
+            }
+            db_.ensure_profile_exists(actor_user_id, "User " + actor_user_id.substr(0, std::min<std::size_t>(8, actor_user_id.size())));
+            db_.patch_privacy_settings(actor_user_id, object);
+            publish_event("user.privacy_updated", JsonObject{{"userId", actor_user_id}});
+            audit("privacy.update", actor_user_id, actor_user_id);
+            increment_metric("privacy.updated");
+            return json_response(200, ensure_db_privacy_exists_and_load(actor_user_id));
+        }
+        auto& settings = require_privacy(actor_user_id);
 
         if (const auto value = optional_string(object, "profileVisibility")) {
             validate_profile_visibility(*value);
