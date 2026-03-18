@@ -742,6 +742,65 @@ public:
         };
     }
 
+    std::optional<JsonObject> get_privacy_settings(const std::string& user_id) const {
+        if (!enabled_) {
+            return std::nullopt;
+        }
+        const std::string sql =
+            "SELECT user_id::text, profile_visibility, dm_policy, friend_request_policy, last_seen_visibility, avatar_visibility, "
+            "to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
+            "to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') "
+            "FROM user_privacy_settings WHERE user_id='" + shell_escape_single_quotes(user_id) + "';";
+        const auto result = query_rows(sql);
+        if (!result.has_value() || result->empty()) {
+            return std::nullopt;
+        }
+        const auto& columns = result->front();
+        if (columns.size() != 8U) {
+            throw std::runtime_error("Unexpected privacy row shape");
+        }
+        return JsonObject{
+            {"userId", columns[0]},
+            {"profileVisibility", columns[1]},
+            {"dmPolicy", columns[2]},
+            {"friendRequestPolicy", columns[3]},
+            {"lastSeenVisibility", columns[4]},
+            {"avatarVisibility", columns[5]},
+            {"createdAt", columns[6]},
+            {"updatedAt", columns[7]},
+        };
+    }
+
+    bool has_block(const std::string& user_id, const std::string& target_user_id) const {
+        if (!enabled_) {
+            return false;
+        }
+        const std::string sql =
+            "SELECT 1 FROM user_blocks "
+            "WHERE user_id='" + shell_escape_single_quotes(user_id) + "' "
+            "AND target_user_id='" + shell_escape_single_quotes(target_user_id) + "' "
+            "LIMIT 1;";
+        return query_scalar(sql).has_value();
+    }
+
+    bool are_friends(const std::string& user_id, const std::string& target_user_id) const {
+        if (!enabled_) {
+            return false;
+        }
+        const std::string sql =
+            "SELECT 1 "
+            "FROM user_relationships lhs "
+            "JOIN user_relationships rhs "
+            "  ON rhs.user_id='" + shell_escape_single_quotes(target_user_id) + "' "
+            " AND rhs.target_user_id='" + shell_escape_single_quotes(user_id) + "' "
+            " AND rhs.status='accepted' "
+            "WHERE lhs.user_id='" + shell_escape_single_quotes(user_id) + "' "
+            "AND lhs.target_user_id='" + shell_escape_single_quotes(target_user_id) + "' "
+            "AND lhs.status='accepted' "
+            "LIMIT 1;";
+        return query_scalar(sql).has_value();
+    }
+
     void ensure_profile_exists(const std::string& user_id, const std::string& display_name) const {
         if (!enabled_) {
             return;
@@ -1196,6 +1255,15 @@ private:
         return *profile;
     }
 
+    JsonObject ensure_db_privacy_exists_and_load(const std::string& user_id) {
+        db_.ensure_profile_exists(user_id, "User " + user_id.substr(0, std::min<std::size_t>(8, user_id.size())));
+        const auto settings = db_.get_privacy_settings(user_id);
+        if (!settings.has_value()) {
+            throw std::runtime_error("Failed to load DB privacy after ensure");
+        }
+        return *settings;
+    }
+
     UserProfile& ensure_memory_profile_exists(const std::string& user_id, const std::optional<std::string>& preferred_display_name) {
         auto it = profiles_.find(user_id);
         if (it != profiles_.end()) {
@@ -1233,6 +1301,14 @@ private:
             .is_friend = is_friend(actor_user_id, target_user_id),
             .is_blocked = has_block(actor_user_id, target_user_id),
             .is_blocked_by_target = has_block(target_user_id, actor_user_id),
+        };
+    }
+
+    RelationshipSummary db_relationship_summary(const std::string& actor_user_id, const std::string& target_user_id) const {
+        return RelationshipSummary{
+            .is_friend = db_.are_friends(actor_user_id, target_user_id),
+            .is_blocked = db_.has_block(actor_user_id, target_user_id),
+            .is_blocked_by_target = db_.has_block(target_user_id, actor_user_id),
         };
     }
 
@@ -1395,6 +1471,62 @@ private:
             return true;
         }
         reason = "dm_policy_denied";
+        return false;
+    }
+
+    bool authorize_dm_action_db(const std::string& actor_user_id, const std::string& target_user_id, std::string& reason) {
+        if (actor_user_id == target_user_id) {
+            reason = "self_dm_not_supported";
+            return false;
+        }
+        const auto summary = db_relationship_summary(actor_user_id, target_user_id);
+        if (summary.is_blocked) {
+            reason = "blocked_by_actor";
+            return false;
+        }
+        if (summary.is_blocked_by_target) {
+            reason = "blocked_by_target";
+            return false;
+        }
+        const auto profile = ensure_db_profile_exists_and_load(target_user_id, std::nullopt);
+        if (required_string(profile, "profileStatus") != "active") {
+            reason = "target_inactive";
+            return false;
+        }
+        const auto settings = ensure_db_privacy_exists_and_load(target_user_id);
+        const auto dm_policy = required_string(settings, "dmPolicy");
+        if (dm_policy == "everyone") {
+            reason.clear();
+            return true;
+        }
+        if (dm_policy == "friends_only" && summary.is_friend) {
+            reason.clear();
+            return true;
+        }
+        reason = "dm_policy_denied";
+        return false;
+    }
+
+    bool authorize_profile_read_db(const std::string& actor_user_id, const std::string& target_user_id) {
+        if (actor_user_id == target_user_id) {
+            return true;
+        }
+        const auto summary = db_relationship_summary(actor_user_id, target_user_id);
+        if (summary.is_blocked || summary.is_blocked_by_target) {
+            return false;
+        }
+        const auto profile = ensure_db_profile_exists_and_load(target_user_id, std::nullopt);
+        if (required_string(profile, "profileStatus") != "active") {
+            return false;
+        }
+        const auto settings = ensure_db_privacy_exists_and_load(target_user_id);
+        const auto profile_visibility = required_string(settings, "profileVisibility");
+        if (profile_visibility == "public") {
+            return true;
+        }
+        if (profile_visibility == "friends_only") {
+            return summary.is_friend;
+        }
         return false;
     }
 
@@ -1624,15 +1756,24 @@ private:
         const std::string target_user_id = required_string(object, "targetUserId");
         const std::string action = required_string(object, "action");
 
-        ensure_profile_exists(actor_user_id);
-        ensure_profile_exists(target_user_id);
+        if (db_.enabled()) {
+            db_.ensure_profile_exists(actor_user_id, "User " + actor_user_id.substr(0, std::min<std::size_t>(8, actor_user_id.size())));
+            db_.ensure_profile_exists(target_user_id, "User " + target_user_id.substr(0, std::min<std::size_t>(8, target_user_id.size())));
+        } else {
+            ensure_profile_exists(actor_user_id);
+            ensure_profile_exists(target_user_id);
+        }
 
         bool allowed = false;
         std::string reason;
-        if (action == "dm.start") {
-            allowed = authorize_dm_start(actor_user_id, target_user_id, reason);
+        if (action == "dm.start" || action == "dm.read" || action == "dm.write") {
+            allowed = db_.enabled()
+                ? authorize_dm_action_db(actor_user_id, target_user_id, reason)
+                : authorize_dm_start(actor_user_id, target_user_id, reason);
         } else if (action == "profile.read") {
-            allowed = authorize_profile_read(actor_user_id, target_user_id);
+            allowed = db_.enabled()
+                ? authorize_profile_read_db(actor_user_id, target_user_id)
+                : authorize_profile_read(actor_user_id, target_user_id);
             if (!allowed) {
                 reason = "profile_visibility_denied";
             }
@@ -1642,7 +1783,9 @@ private:
             throw std::runtime_error("Unsupported action: " + action);
         }
 
-        const auto summary = relationship_summary(actor_user_id, target_user_id);
+        const auto summary = db_.enabled()
+            ? db_relationship_summary(actor_user_id, target_user_id)
+            : relationship_summary(actor_user_id, target_user_id);
         return json_response(200, JsonObject{
             {"allowed", allowed},
             {"reason", reason.empty() ? Json(nullptr) : Json(reason)},
@@ -1660,6 +1803,11 @@ private:
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
         const std::string actor_user_id = required_string(object, "actorUserId");
+        if (db_.enabled()) {
+            db_.ensure_profile_exists(actor_user_id, "User " + actor_user_id.substr(0, std::min<std::size_t>(8, actor_user_id.size())));
+            db_.ensure_profile_exists(user_id, "User " + user_id.substr(0, std::min<std::size_t>(8, user_id.size())));
+            return json_response(200, JsonObject{{"allowed", authorize_profile_read_db(actor_user_id, user_id)}});
+        }
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(user_id);
         return json_response(200, JsonObject{{"allowed", authorize_profile_read(actor_user_id, user_id)}});
