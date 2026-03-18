@@ -133,7 +133,7 @@ jobs:
             sleep 2
             sudo systemctl --no-pager --full status user-service
 
-      - name: Healthcheck
+      - name: Internal healthcheck
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ vars.DEPLOY_HOST }}
@@ -144,7 +144,11 @@ jobs:
           script: |
             set -euo pipefail
             curl -fsS http://127.0.0.1:${{ vars.SERVICE_PORT }}/health
-            curl -fsS https://${{ vars.PUBLIC_BASE_HOST }}/user/health
+
+      - name: External healthcheck
+        run: |
+          set -euo pipefail
+          curl -fsS https://${PUBLIC_BASE_HOST}/user/health
 
       - name: Acceptance smoke test
         env:
