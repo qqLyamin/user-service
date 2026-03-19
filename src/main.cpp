@@ -1352,6 +1352,7 @@ private:
     std::optional<std::string> jwt_issuer_ = get_env("JWT_ISSUER");
     std::optional<std::string> jwt_audience_ = get_env("JWT_AUDIENCE");
     std::optional<std::string> jwt_secret_ = get_env("JWT_SECRET");
+    std::optional<std::string> internal_token_ = get_env("INTERNAL_TOKEN");
     std::unordered_map<std::string, UserProfile> profiles_;
     std::unordered_map<std::string, PrivacySettings> privacy_;
     std::unordered_map<std::string, RelationshipRecord> relationships_;
@@ -1775,10 +1776,15 @@ private:
         return parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_, jwt_secret_).display_name;
     }
 
-    void require_internal_token(const Request& request) const {
+    void require_internal_token(const Request& request) {
+        if (request.headers.find("authorization") != request.headers.end()) {
+            require_actor_user_id(request);
+            return;
+        }
         const auto it = request.headers.find("x-internal-token");
-        if (it == request.headers.end() || trim(it->second) != "internal-secret") {
-            throw std::runtime_error("Missing or invalid x-internal-token");
+        const std::string expected = internal_token_.value_or("internal-secret");
+        if (it == request.headers.end() || trim(it->second) != expected) {
+            throw HttpError(401, "unauthorized", "Missing or invalid internal authentication");
         }
     }
 
