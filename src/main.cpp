@@ -496,7 +496,7 @@ std::optional<std::string> get_env(const char* key) {
 }
 
 bool is_uuid_like(const std::string& value) {
-    static const std::regex pattern("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$");
+    static const std::regex pattern("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
     return std::regex_match(value, pattern);
 }
 
