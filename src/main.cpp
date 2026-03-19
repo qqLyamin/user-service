@@ -1460,6 +1460,15 @@ private:
         const std::string prefix = "bearer user:";
         if (header.rfind(prefix, 0) == 0) {
             const auto actor_user_id = canonical_user_id(trim(raw_header.substr(prefix.size())));
+            current_jwt_principal_ = JwtPrincipal{
+                .raw_user_id = actor_user_id,
+                .canonical_id = actor_user_id,
+                .subject = actor_user_id,
+                .issuer = std::nullopt,
+                .audience = std::nullopt,
+                .exp = std::nullopt,
+                .display_name = std::nullopt,
+            };
             log_auth_result("200", actor_user_id, "allow", "ok", std::nullopt, true, true, true);
             return actor_user_id;
         }
@@ -1956,7 +1965,7 @@ private:
         processed_event_ids_.insert(event_id);
 
         if (type == "auth.user_registered") {
-            const std::string user_id = required_string(payload, "userId");
+            const std::string user_id = canonical_user_id(required_string(payload, "userId"));
             const std::string timestamp = now_iso8601();
             UserProfile profile;
             profile.user_id = user_id;
@@ -1993,7 +2002,7 @@ private:
         }
 
         if (type == "auth.user_disabled" || type == "auth.user_enabled" || type == "auth.user_deleted") {
-            const std::string user_id = required_string(payload, "userId");
+            const std::string user_id = canonical_user_id(required_string(payload, "userId"));
             auto& profile = require_profile(user_id);
             profile.updated_at = now_iso8601();
             if (type == "auth.user_disabled") {
