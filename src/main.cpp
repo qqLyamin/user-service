@@ -1064,6 +1064,48 @@ public:
         return true;
     }
 
+    void create_block(const std::string& actor_user_id, const std::string& target_user_id, const std::optional<std::string>& reason) const {
+        if (!enabled_) {
+            return;
+        }
+        const auto now = now_iso8601();
+        const std::string escaped_reason = reason.has_value() ? "'" + shell_escape_single_quotes(*reason) + "'" : "NULL";
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "INSERT INTO user_blocks (block_id, user_id, target_user_id, reason, created_at) VALUES ('"
+            << shell_escape_single_quotes(hash_to_uuid("block-" + actor_user_id + "-" + target_user_id + "-" + now)) << "','"
+            << shell_escape_single_quotes(actor_user_id) << "','" << shell_escape_single_quotes(target_user_id) << "',"
+            << escaped_reason << ",NOW()) ON CONFLICT (user_id, target_user_id) DO NOTHING;";
+        sql << "UPDATE user_relationships SET status='removed', updated_at=NOW() WHERE relation_type='friend' AND "
+            << "((user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "') OR "
+            << "(user_id='" << shell_escape_single_quotes(target_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "'));";
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ('"
+            << shell_escape_single_quotes(hash_to_uuid("block-created-" + actor_user_id + "-" + target_user_id + "-" + now)) << "','user_block','"
+            << shell_escape_single_quotes(actor_user_id) << "','user.block_created','{\"userId\":\""
+            << shell_escape_single_quotes(actor_user_id) << "\",\"targetUserId\":\"" << shell_escape_single_quotes(target_user_id)
+            << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+    }
+
+    void remove_block(const std::string& actor_user_id, const std::string& target_user_id) const {
+        if (!enabled_) {
+            return;
+        }
+        const auto now = now_iso8601();
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "DELETE FROM user_blocks WHERE user_id='" << shell_escape_single_quotes(actor_user_id)
+            << "' AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "';";
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ('"
+            << shell_escape_single_quotes(hash_to_uuid("block-removed-" + actor_user_id + "-" + target_user_id + "-" + now)) << "','user_block','"
+            << shell_escape_single_quotes(actor_user_id) << "','user.block_removed','{\"userId\":\""
+            << shell_escape_single_quotes(actor_user_id) << "\",\"targetUserId\":\"" << shell_escape_single_quotes(target_user_id)
+            << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+    }
+
     void patch_privacy_settings(const std::string& user_id, const JsonObject& patch) const {
         if (!enabled_) {
             return;
@@ -2753,12 +2795,16 @@ private:
             const auto& object = require_object(body);
             reason = optional_string(object, "reason");
         }
-        const auto key = pair_key(actor_user_id, target_user_id);
-        blocks_[key] = BlockRecord{actor_user_id, target_user_id, reason, now_iso8601()};
-        set_relationship(actor_user_id, target_user_id, "removed");
-        set_relationship(target_user_id, actor_user_id, "removed");
-        hide_dm_projections_between(actor_user_id, target_user_id);
-        publish_event("user.block_created", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
+        if (db_.enabled()) {
+            db_.create_block(actor_user_id, target_user_id, reason);
+        } else {
+            const auto key = pair_key(actor_user_id, target_user_id);
+            blocks_[key] = BlockRecord{actor_user_id, target_user_id, reason, now_iso8601()};
+            set_relationship(actor_user_id, target_user_id, "removed");
+            set_relationship(target_user_id, actor_user_id, "removed");
+            hide_dm_projections_between(actor_user_id, target_user_id);
+            publish_event("user.block_created", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
+        }
         audit("block.create", actor_user_id, target_user_id);
         increment_metric("block.created");
         return json_response(201, JsonObject{{"status", "blocked"}, {"targetUserId", target_user_id}});
@@ -2768,8 +2814,12 @@ private:
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(target_user_id);
-        blocks_.erase(pair_key(actor_user_id, target_user_id));
-        publish_event("user.block_removed", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
+        if (db_.enabled()) {
+            db_.remove_block(actor_user_id, target_user_id);
+        } else {
+            blocks_.erase(pair_key(actor_user_id, target_user_id));
+            publish_event("user.block_removed", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
+        }
         audit("block.remove", actor_user_id, target_user_id);
         increment_metric("block.removed");
         return json_response(200, JsonObject{{"status", "unblocked"}, {"targetUserId", target_user_id}});
