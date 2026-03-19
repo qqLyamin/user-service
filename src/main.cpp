@@ -2086,15 +2086,15 @@ private:
         if (!starts_with(path, prefix) || !ends_with(path, suffix)) {
             throw std::runtime_error("Unexpected path");
         }
-        return path.substr(prefix.size(), path.size() - prefix.size() - suffix.size());
+        return canonical_user_id(path.substr(prefix.size(), path.size() - prefix.size() - suffix.size()));
     }
 
     Response internal_relationship_check(const Request& request) {
         require_internal_token(request);
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
-        const std::string actor_user_id = required_string(object, "actorUserId");
-        const std::string target_user_id = required_string(object, "targetUserId");
+        const std::string actor_user_id = canonical_user_id(required_string(object, "actorUserId"));
+        const std::string target_user_id = canonical_user_id(required_string(object, "targetUserId"));
         const std::string action = required_string(object, "action");
 
         ensure_profile_exists(actor_user_id);
@@ -2138,7 +2138,7 @@ private:
         const auto user_id = extract_user_id_from_internal_path(request.path, "/authorize-profile-read");
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
-        const std::string actor_user_id = required_string(object, "actorUserId");
+        const std::string actor_user_id = canonical_user_id(required_string(object, "actorUserId"));
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(user_id);
         return json_response(200, JsonObject{{"allowed", db_.enabled() ? Json(authorize_profile_read_db(actor_user_id, user_id)) : Json(authorize_profile_read(actor_user_id, user_id))}});
