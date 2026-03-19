@@ -1394,26 +1394,27 @@ private:
 
     Response handle_user_scoped_route(const Request& request) {
         const auto segments = split_path(request.path);
+        const auto target_user_id = segments.size() >= 3 ? canonical_user_id(segments[2]) : std::string{};
         if (segments.size() == 3 && request.method == "GET") {
-            return get_user_by_id(request, segments[2]);
+            return get_user_by_id(request, target_user_id);
         }
         if (segments.size() == 4 && segments[3] == "friend-request" && request.method == "POST") {
-            return send_friend_request(request, segments[2]);
+            return send_friend_request(request, target_user_id);
         }
         if (segments.size() == 5 && segments[3] == "friend-request" && segments[4] == "accept" && request.method == "POST") {
-            return accept_friend_request(request, segments[2]);
+            return accept_friend_request(request, target_user_id);
         }
         if (segments.size() == 5 && segments[3] == "friend-request" && segments[4] == "decline" && request.method == "POST") {
-            return decline_friend_request(request, segments[2]);
+            return decline_friend_request(request, target_user_id);
         }
         if (segments.size() == 4 && segments[3] == "friend" && request.method == "DELETE") {
-            return remove_friend(request, segments[2]);
+            return remove_friend(request, target_user_id);
         }
         if (segments.size() == 4 && segments[3] == "block" && request.method == "POST") {
-            return block_user(request, segments[2]);
+            return block_user(request, target_user_id);
         }
         if (segments.size() == 4 && segments[3] == "block" && request.method == "DELETE") {
-            return unblock_user(request, segments[2]);
+            return unblock_user(request, target_user_id);
         }
         return error_response(404, "not_found", "Route not found");
     }
