@@ -25,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <regex>
+#include <array>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -406,6 +407,14 @@ struct Response {
     std::unordered_map<std::string, std::string> headers;
 };
 
+struct HttpError : public std::runtime_error {
+    int status;
+    std::string code;
+
+    HttpError(int status_code, std::string error_code, const std::string& message)
+        : std::runtime_error(message), status(status_code), code(std::move(error_code)) {}
+};
+
 struct RelationshipRecord {
     std::string user_id;
     std::string target_user_id;
@@ -611,6 +620,127 @@ std::string base64url_decode(std::string input) {
     return output;
 }
 
+std::string base64url_encode(const std::string& input) {
+    static const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string output;
+    int val = 0;
+    int valb = -6;
+    for (unsigned char ch : input) {
+        val = (val << 8) + ch;
+        valb += 8;
+        while (valb >= 0) {
+            output.push_back(alphabet[(val >> valb) & 0x3f]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) {
+        output.push_back(alphabet[((val << 8) >> (valb + 8)) & 0x3f]);
+    }
+    return output;
+}
+
+std::uint32_t rotr32(const std::uint32_t value, const std::uint32_t bits) {
+    return (value >> bits) | (value << (32U - bits));
+}
+
+std::array<std::uint8_t, 32> sha256_bytes(const std::string& input) {
+    static const std::uint32_t k[64] = {
+        0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+        0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+        0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+        0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+        0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+        0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+        0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+        0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U
+    };
+    std::array<std::uint32_t, 8> h = {
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U
+    };
+    std::vector<std::uint8_t> msg(input.begin(), input.end());
+    const std::uint64_t bit_length = static_cast<std::uint64_t>(msg.size()) * 8ULL;
+    msg.push_back(0x80U);
+    while ((msg.size() % 64U) != 56U) {
+        msg.push_back(0U);
+    }
+    for (int i = 7; i >= 0; --i) {
+        msg.push_back(static_cast<std::uint8_t>((bit_length >> (i * 8)) & 0xffU));
+    }
+    for (std::size_t offset = 0; offset < msg.size(); offset += 64U) {
+        std::uint32_t w[64]{};
+        for (std::size_t i = 0; i < 16U; ++i) {
+            const std::size_t j = offset + i * 4U;
+            w[i] = (static_cast<std::uint32_t>(msg[j]) << 24U) |
+                   (static_cast<std::uint32_t>(msg[j + 1]) << 16U) |
+                   (static_cast<std::uint32_t>(msg[j + 2]) << 8U) |
+                   static_cast<std::uint32_t>(msg[j + 3]);
+        }
+        for (std::size_t i = 16U; i < 64U; ++i) {
+            const std::uint32_t s0 = rotr32(w[i - 15U], 7U) ^ rotr32(w[i - 15U], 18U) ^ (w[i - 15U] >> 3U);
+            const std::uint32_t s1 = rotr32(w[i - 2U], 17U) ^ rotr32(w[i - 2U], 19U) ^ (w[i - 2U] >> 10U);
+            w[i] = w[i - 16U] + s0 + w[i - 7U] + s1;
+        }
+        std::uint32_t a = h[0];
+        std::uint32_t b = h[1];
+        std::uint32_t c = h[2];
+        std::uint32_t d = h[3];
+        std::uint32_t e = h[4];
+        std::uint32_t f = h[5];
+        std::uint32_t g = h[6];
+        std::uint32_t hh = h[7];
+        for (std::size_t i = 0; i < 64U; ++i) {
+            const std::uint32_t s1 = rotr32(e, 6U) ^ rotr32(e, 11U) ^ rotr32(e, 25U);
+            const std::uint32_t ch = (e & f) ^ ((~e) & g);
+            const std::uint32_t temp1 = hh + s1 + ch + k[i] + w[i];
+            const std::uint32_t s0 = rotr32(a, 2U) ^ rotr32(a, 13U) ^ rotr32(a, 22U);
+            const std::uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const std::uint32_t temp2 = s0 + maj;
+            hh = g; g = f; f = e; e = d + temp1; d = c; c = b; b = a; a = temp1 + temp2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+    std::array<std::uint8_t, 32> out{};
+    for (std::size_t i = 0; i < h.size(); ++i) {
+        out[i * 4U] = static_cast<std::uint8_t>((h[i] >> 24U) & 0xffU);
+        out[i * 4U + 1U] = static_cast<std::uint8_t>((h[i] >> 16U) & 0xffU);
+        out[i * 4U + 2U] = static_cast<std::uint8_t>((h[i] >> 8U) & 0xffU);
+        out[i * 4U + 3U] = static_cast<std::uint8_t>(h[i] & 0xffU);
+    }
+    return out;
+}
+
+std::string hmac_sha256(const std::string& key, const std::string& message) {
+    constexpr std::size_t block_size = 64U;
+    std::string normalized_key = key;
+    if (normalized_key.size() > block_size) {
+        const auto hashed = sha256_bytes(normalized_key);
+        normalized_key.assign(reinterpret_cast<const char*>(hashed.data()), hashed.size());
+    }
+    normalized_key.resize(block_size, '\0');
+    std::string o_key_pad(block_size, '\0');
+    std::string i_key_pad(block_size, '\0');
+    for (std::size_t i = 0; i < block_size; ++i) {
+        o_key_pad[i] = static_cast<char>(normalized_key[i] ^ 0x5c);
+        i_key_pad[i] = static_cast<char>(normalized_key[i] ^ 0x36);
+    }
+    const auto inner = sha256_bytes(i_key_pad + message);
+    const std::string inner_bytes(reinterpret_cast<const char*>(inner.data()), inner.size());
+    const auto outer = sha256_bytes(o_key_pad + inner_bytes);
+    return std::string(reinterpret_cast<const char*>(outer.data()), outer.size());
+}
+
+bool constant_time_equals(const std::string& lhs, const std::string& rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        diff |= static_cast<unsigned char>(lhs[i] ^ rhs[i]);
+    }
+    return diff == 0;
+}
+
 struct JwtPrincipal {
     std::string raw_user_id;
     std::string canonical_id;
@@ -624,7 +754,8 @@ struct JwtPrincipal {
 JwtPrincipal parse_jwt_without_signature_validation(
     const std::string& token,
     const std::optional<std::string>& required_issuer,
-    const std::optional<std::string>& required_audience) {
+    const std::optional<std::string>& required_audience,
+    const std::optional<std::string>& required_secret) {
     std::stringstream ss(token);
     std::string header_part;
     std::string payload_part;
@@ -639,6 +770,20 @@ JwtPrincipal parse_jwt_without_signature_validation(
     const auto payload = require_object(JsonParser(base64url_decode(payload_part)).parse());
     if (header.count("typ") != 0 && header.at("typ").is_string() && to_lower(header.at("typ").as_string()) != "jwt") {
         throw std::runtime_error("Unsupported JWT typ");
+    }
+    if (!required_secret.has_value()) {
+        throw std::runtime_error("JWT secret is not configured");
+    }
+    if (required_string(header, "alg") != "HS256") {
+        throw std::runtime_error("Unsupported JWT alg");
+    }
+    if (signature_part.empty()) {
+        throw std::runtime_error("Malformed JWT");
+    }
+    const std::string signing_input = header_part + "." + payload_part;
+    const std::string expected_signature = base64url_encode(hmac_sha256(*required_secret, signing_input));
+    if (!constant_time_equals(expected_signature, signature_part)) {
+        throw std::runtime_error("JWT signature mismatch");
     }
     if (required_issuer.has_value()) {
         const auto issuer = required_string(payload, "iss");
@@ -811,6 +956,112 @@ public:
             "AND lhs.status='accepted' "
             "LIMIT 1;";
         return query_scalar(sql).has_value();
+    }
+
+    std::optional<std::string> get_relationship_status(const std::string& user_id, const std::string& target_user_id) const {
+        if (!enabled_) {
+            return std::nullopt;
+        }
+        const std::string sql =
+            "SELECT status FROM user_relationships "
+            "WHERE user_id='" + shell_escape_single_quotes(user_id) + "' "
+            "AND target_user_id='" + shell_escape_single_quotes(target_user_id) + "' "
+            "AND relation_type='friend' LIMIT 1;";
+        return query_scalar(sql);
+    }
+
+    bool has_mutual_friend(const std::string& user_id, const std::string& target_user_id) const {
+        if (!enabled_) {
+            return false;
+        }
+        const std::string sql =
+            "SELECT 1 FROM user_relationships ua "
+            "JOIN user_relationships ub ON ub.user_id='" + shell_escape_single_quotes(target_user_id) + "' "
+            "AND ub.target_user_id=ua.target_user_id AND ub.relation_type='friend' AND ub.status='accepted' "
+            "WHERE ua.user_id='" + shell_escape_single_quotes(user_id) + "' "
+            "AND ua.target_user_id NOT IN ('" + shell_escape_single_quotes(user_id) + "','" + shell_escape_single_quotes(target_user_id) + "') "
+            "AND ua.relation_type='friend' AND ua.status='accepted' LIMIT 1;";
+        return query_scalar(sql).has_value();
+    }
+
+    void create_friend_request(const std::string& actor_user_id, const std::string& target_user_id) const {
+        if (!enabled_) {
+            return;
+        }
+        const auto now = now_iso8601();
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "INSERT INTO user_relationships (relation_id, user_id, target_user_id, relation_type, status, created_at, updated_at) VALUES ("
+            << "'" << shell_escape_single_quotes(hash_to_uuid("rel-out-" + actor_user_id + "-" + target_user_id + "-" + now)) << "','"
+            << shell_escape_single_quotes(actor_user_id) << "','" << shell_escape_single_quotes(target_user_id) << "','friend','pending_outgoing',NOW(),NOW()) "
+            << "ON CONFLICT (user_id, target_user_id, relation_type) DO UPDATE SET status='pending_outgoing', updated_at=NOW();";
+        sql << "INSERT INTO user_relationships (relation_id, user_id, target_user_id, relation_type, status, created_at, updated_at) VALUES ("
+            << "'" << shell_escape_single_quotes(hash_to_uuid("rel-in-" + target_user_id + "-" + actor_user_id + "-" + now)) << "','"
+            << shell_escape_single_quotes(target_user_id) << "','" << shell_escape_single_quotes(actor_user_id) << "','friend','pending_incoming',NOW(),NOW()) "
+            << "ON CONFLICT (user_id, target_user_id, relation_type) DO UPDATE SET status='pending_incoming', updated_at=NOW();";
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ("
+            << "'" << shell_escape_single_quotes(hash_to_uuid("friend-request-created-" + actor_user_id + "-" + target_user_id + "-" + now)) << "','user_relationship','"
+            << shell_escape_single_quotes(actor_user_id) << "','user.friend_request_created','{\"userId\":\""
+            << shell_escape_single_quotes(actor_user_id) << "\",\"targetUserId\":\"" << shell_escape_single_quotes(target_user_id)
+            << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+    }
+
+    bool accept_friend_request(const std::string& actor_user_id, const std::string& target_user_id) const {
+        if (get_relationship_status(actor_user_id, target_user_id) != std::optional<std::string>("pending_incoming") ||
+            get_relationship_status(target_user_id, actor_user_id) != std::optional<std::string>("pending_outgoing")) {
+            return false;
+        }
+        const auto now = now_iso8601();
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "UPDATE user_relationships SET status='accepted', updated_at=NOW() WHERE relation_type='friend' AND "
+            << "((user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "') OR "
+            << "(user_id='" << shell_escape_single_quotes(target_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "'));";
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ("
+            << "'" << shell_escape_single_quotes(hash_to_uuid("friend-request-accepted-" + actor_user_id + "-" + target_user_id + "-" + now)) << "','user_relationship','"
+            << shell_escape_single_quotes(actor_user_id) << "','user.friend_request_accepted','{\"userId\":\""
+            << shell_escape_single_quotes(actor_user_id) << "\",\"targetUserId\":\"" << shell_escape_single_quotes(target_user_id)
+            << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+        return true;
+    }
+
+    bool decline_friend_request(const std::string& actor_user_id, const std::string& target_user_id) const {
+        if (get_relationship_status(actor_user_id, target_user_id) != std::optional<std::string>("pending_incoming") ||
+            get_relationship_status(target_user_id, actor_user_id) != std::optional<std::string>("pending_outgoing")) {
+            return false;
+        }
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "UPDATE user_relationships SET status='declined', updated_at=NOW() WHERE relation_type='friend' AND "
+            << "((user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "') OR "
+            << "(user_id='" << shell_escape_single_quotes(target_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "'));";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+        return true;
+    }
+
+    bool remove_friend(const std::string& actor_user_id, const std::string& target_user_id) const {
+        if (!are_friends(actor_user_id, target_user_id)) {
+            return false;
+        }
+        const auto now = now_iso8601();
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "UPDATE user_relationships SET status='removed', updated_at=NOW() WHERE relation_type='friend' AND "
+            << "((user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "') OR "
+            << "(user_id='" << shell_escape_single_quotes(target_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "'));";
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ("
+            << "'" << shell_escape_single_quotes(hash_to_uuid("friend-removed-" + actor_user_id + "-" + target_user_id + "-" + now)) << "','user_relationship','"
+            << shell_escape_single_quotes(actor_user_id) << "','user.friend_removed','{\"userId\":\""
+            << shell_escape_single_quotes(actor_user_id) << "\",\"targetUserId\":\"" << shell_escape_single_quotes(target_user_id)
+            << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+        return true;
     }
 
     void patch_privacy_settings(const std::string& user_id, const JsonObject& patch) const {
@@ -1084,6 +1335,10 @@ public:
             auto response = route(request);
             reset_request_context();
             return response;
+        } catch (const HttpError& ex) {
+            auto response = error_response(ex.status, ex.code, ex.what());
+            reset_request_context();
+            return response;
         } catch (const std::exception& ex) {
             auto response = error_response(400, "bad_request", ex.what());
             reset_request_context();
@@ -1096,6 +1351,7 @@ private:
     PostgresPsqlAdapter db_;
     std::optional<std::string> jwt_issuer_ = get_env("JWT_ISSUER");
     std::optional<std::string> jwt_audience_ = get_env("JWT_AUDIENCE");
+    std::optional<std::string> jwt_secret_ = get_env("JWT_SECRET");
     std::unordered_map<std::string, UserProfile> profiles_;
     std::unordered_map<std::string, PrivacySettings> privacy_;
     std::unordered_map<std::string, RelationshipRecord> relationships_;
@@ -1200,6 +1456,7 @@ private:
         const std::string& decision,
         const std::string& reason,
         const std::optional<JwtPrincipal>& principal,
+        const std::string& token_signature_valid,
         const bool auth_header_present,
         const bool bearer_present,
         const bool token_parse_ok) const {
@@ -1214,7 +1471,7 @@ private:
                 {"authHeaderPresent", bool_string(auth_header_present)},
                 {"bearerPresent", bool_string(bearer_present)},
                 {"tokenParseOk", bool_string(token_parse_ok)},
-                {"tokenSignatureValid", principal.has_value() ? "not_checked" : "false"},
+                {"tokenSignatureValid", token_signature_valid},
                 {"tokenSub", principal.has_value() ? principal->subject : "-"},
                 {"tokenUserId", principal.has_value() ? principal->canonical_id : "-"},
                 {"tokenIssuer", principal.has_value() ? optional_log_value(principal->issuer) : "-"},
@@ -1455,8 +1712,8 @@ private:
         const bool bearer_present = header.rfind("bearer ", 0) == 0;
         log_auth_start(request, auth_header_present, bearer_present);
         if (it == request.headers.end()) {
-            log_auth_result("400", "-", "deny", "missing_bearer", std::nullopt, false, false, false);
-            throw std::runtime_error("Missing Authorization header");
+            log_auth_result("401", "-", "deny", "missing_bearer", std::nullopt, "false", false, false, false);
+            throw HttpError(401, "unauthorized", "Missing Authorization header");
         }
         const std::string prefix = "bearer user:";
         if (header.rfind(prefix, 0) == 0) {
@@ -1470,17 +1727,17 @@ private:
                 .exp = std::nullopt,
                 .display_name = std::nullopt,
             };
-            log_auth_result("200", actor_user_id, "allow", "ok", std::nullopt, true, true, true);
+            log_auth_result("200", actor_user_id, "allow", "ok", std::nullopt, "legacy", true, true, true);
             return actor_user_id;
         }
         const std::string bearer_prefix = "bearer ";
         if (header.rfind(bearer_prefix, 0) != 0) {
-            log_auth_result("400", "-", "deny", "missing_bearer", std::nullopt, true, false, false);
-            throw std::runtime_error("Expected Authorization: Bearer <jwt> or Bearer user:<user-id>");
+            log_auth_result("401", "-", "deny", "missing_bearer", std::nullopt, "false", true, false, false);
+            throw HttpError(401, "unauthorized", "Expected Authorization: Bearer <jwt> or Bearer user:<user-id>");
         }
         std::optional<JwtPrincipal> principal;
         try {
-            principal = parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_);
+            principal = parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_, jwt_secret_);
         } catch (const std::exception& ex) {
             std::string reason = "claims_mismatch";
             const std::string message = ex.what();
@@ -1490,14 +1747,14 @@ private:
                 reason = "bad_audience";
             } else if (message.find("expired") != std::string::npos) {
                 reason = "expired";
-            } else if (message.find("Malformed JWT") != std::string::npos || message.find("base64url") != std::string::npos) {
+            } else if (message.find("signature mismatch") != std::string::npos || message.find("Malformed JWT") != std::string::npos || message.find("base64url") != std::string::npos || message.find("secret") != std::string::npos || message.find("alg") != std::string::npos) {
                 reason = "bad_signature";
             }
-            log_auth_result("400", "-", "deny", reason, std::nullopt, true, true, false);
-            throw;
+            log_auth_result("401", "-", "deny", reason, std::nullopt, "false", true, true, false);
+            throw HttpError(401, "unauthorized", ex.what());
         }
         current_jwt_principal_ = principal;
-        log_auth_result("200", principal->canonical_id, "allow", "ok", principal, true, true, true);
+        log_auth_result("200", principal->canonical_id, "allow", "ok", principal, "true", true, true, true);
         return principal->canonical_id;
     }
 
@@ -1515,7 +1772,7 @@ private:
         if (header.rfind(bearer_prefix, 0) != 0 || header.rfind("bearer user:", 0) == 0) {
             return std::nullopt;
         }
-        return parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_).display_name;
+        return parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_, jwt_secret_).display_name;
     }
 
     void require_internal_token(const Request& request) const {
@@ -1889,6 +2146,32 @@ private:
         return false;
     }
 
+    bool allows_friend_request_db(const std::string& actor_user_id, const std::string& target_user_id, std::string& reason) {
+        const auto summary = db_relationship_summary(actor_user_id, target_user_id);
+        ensure_db_privacy_exists_and_load(actor_user_id);
+        const auto settings = ensure_db_privacy_exists_and_load(target_user_id);
+        if (summary.is_blocked || summary.is_blocked_by_target) {
+            reason = "blocked";
+            log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", reason, "true", "true", "-");
+            return false;
+        }
+        const auto policy = required_string(settings, "friendRequestPolicy");
+        if (policy == "everyone") {
+            reason.clear();
+            log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "allow", "policy_resolved", "true", "true", policy, "-");
+            return true;
+        }
+        if (policy == "mutuals_only") {
+            const bool allowed = db_.has_mutual_friend(actor_user_id, target_user_id);
+            reason = allowed ? "" : "friend_request_policy_denied";
+            log_privacy_resolution(actor_user_id, target_user_id, "friend_request", allowed ? "allow" : "deny", allowed ? "policy_resolved" : reason, "true", "true", policy, allowed ? "true" : "false");
+            return allowed;
+        }
+        reason = "friend_request_policy_denied";
+        log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", reason, "true", "true", policy, "-");
+        return false;
+    }
+
     void ensure_profile_exists(const std::string& user_id) const {
         if (db_.enabled()) {
             if (db_.get_profile(user_id).has_value()) {
@@ -2115,7 +2398,9 @@ private:
                 reason = "profile_visibility_denied";
             }
         } else if (action == "friend.request.send") {
-            allowed = allows_friend_request(actor_user_id, target_user_id, reason);
+            allowed = db_.enabled()
+                ? allows_friend_request_db(actor_user_id, target_user_id, reason)
+                : allows_friend_request(actor_user_id, target_user_id, reason);
         } else {
             throw std::runtime_error("Unsupported action: " + action);
         }
@@ -2293,17 +2578,28 @@ private:
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(target_user_id);
-        const auto relationship_before = relationship_state_before(actor_user_id, target_user_id);
-        const bool already_friend = is_friend(actor_user_id, target_user_id);
-        const bool pending_outgoing = has_pending_outgoing(actor_user_id, target_user_id);
-        const bool pending_incoming = has_pending_incoming(actor_user_id, target_user_id);
-        const std::string target_policy = privacy_.count(target_user_id) != 0 ? privacy_.at(target_user_id).friend_request_policy : "-";
+        const auto relationship_before = db_.enabled()
+            ? db_.get_relationship_status(actor_user_id, target_user_id).value_or("none")
+            : relationship_state_before(actor_user_id, target_user_id);
+        const bool already_friend = db_.enabled() ? db_.are_friends(actor_user_id, target_user_id) : is_friend(actor_user_id, target_user_id);
+        const bool pending_outgoing = db_.enabled()
+            ? db_.get_relationship_status(actor_user_id, target_user_id) == std::optional<std::string>("pending_outgoing")
+            : has_pending_outgoing(actor_user_id, target_user_id);
+        const bool pending_incoming = db_.enabled()
+            ? db_.get_relationship_status(actor_user_id, target_user_id) == std::optional<std::string>("pending_incoming")
+            : has_pending_incoming(actor_user_id, target_user_id);
+        const std::string target_policy = db_.enabled()
+            ? required_string(ensure_db_privacy_exists_and_load(target_user_id), "friendRequestPolicy")
+            : (privacy_.count(target_user_id) != 0 ? privacy_.at(target_user_id).friend_request_policy : "-");
         if (actor_user_id == target_user_id) {
             log_friend_request_decision("400", actor_user_id, target_user_id, "deny", "self_friend_not_supported", relationship_before, already_friend, pending_outgoing, pending_incoming, target_policy, "0");
             return error_response(400, "bad_request", "Cannot friend yourself");
         }
         std::string reason;
-        if (!allows_friend_request(actor_user_id, target_user_id, reason)) {
+        const bool allowed = db_.enabled()
+            ? allows_friend_request_db(actor_user_id, target_user_id, reason)
+            : allows_friend_request(actor_user_id, target_user_id, reason);
+        if (!allowed) {
             log_friend_request_decision("403", actor_user_id, target_user_id, "deny", reason, relationship_before, already_friend, pending_outgoing, pending_incoming, target_policy, "0");
             return error_response(403, "forbidden", reason);
         }
@@ -2311,10 +2607,16 @@ private:
             log_friend_request_decision("409", actor_user_id, target_user_id, "deny", "already_friends", relationship_before, already_friend, pending_outgoing, pending_incoming, target_policy, "0");
             return error_response(409, "conflict", "Users are already friends");
         }
-        set_relationship(actor_user_id, target_user_id, "pending_outgoing");
-        set_relationship(target_user_id, actor_user_id, "pending_incoming");
+        if (db_.enabled()) {
+            db_.create_friend_request(actor_user_id, target_user_id);
+        } else {
+            set_relationship(actor_user_id, target_user_id, "pending_outgoing");
+            set_relationship(target_user_id, actor_user_id, "pending_incoming");
+        }
         log_friend_request_decision("201", actor_user_id, target_user_id, "allow", "created", relationship_before, already_friend, pending_outgoing, pending_incoming, target_policy, "1");
-        publish_event("user.friend_request_created", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
+        if (!db_.enabled()) {
+            publish_event("user.friend_request_created", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
+        }
         audit("friend_request.create", actor_user_id, target_user_id);
         increment_metric("friend_request.created");
         return json_response(201, JsonObject{{"status", "pending"}, {"targetUserId", target_user_id}});
@@ -2324,16 +2626,22 @@ private:
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(target_user_id);
-        const auto incoming_key = pair_key(actor_user_id, target_user_id);
-        const auto outgoing_key = pair_key(target_user_id, actor_user_id);
-        if (!relationships_.count(incoming_key) || !relationships_.count(outgoing_key) ||
-            relationships_[incoming_key].status != "pending_incoming" ||
-            relationships_[outgoing_key].status != "pending_outgoing") {
-            return error_response(409, "conflict", "No pending friend request to accept");
+        if (db_.enabled()) {
+            if (!db_.accept_friend_request(actor_user_id, target_user_id)) {
+                return error_response(409, "conflict", "No pending friend request to accept");
+            }
+        } else {
+            const auto incoming_key = pair_key(actor_user_id, target_user_id);
+            const auto outgoing_key = pair_key(target_user_id, actor_user_id);
+            if (!relationships_.count(incoming_key) || !relationships_.count(outgoing_key) ||
+                relationships_[incoming_key].status != "pending_incoming" ||
+                relationships_[outgoing_key].status != "pending_outgoing") {
+                return error_response(409, "conflict", "No pending friend request to accept");
+            }
+            set_relationship(actor_user_id, target_user_id, "accepted");
+            set_relationship(target_user_id, actor_user_id, "accepted");
+            publish_event("user.friend_request_accepted", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
         }
-        set_relationship(actor_user_id, target_user_id, "accepted");
-        set_relationship(target_user_id, actor_user_id, "accepted");
-        publish_event("user.friend_request_accepted", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
         audit("friend_request.accept", actor_user_id, target_user_id);
         increment_metric("friend_request.accepted");
         return json_response(200, JsonObject{{"status", "accepted"}, {"targetUserId", target_user_id}});
@@ -2343,15 +2651,21 @@ private:
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(target_user_id);
-        const auto incoming_key = pair_key(actor_user_id, target_user_id);
-        const auto outgoing_key = pair_key(target_user_id, actor_user_id);
-        if (!relationships_.count(incoming_key) || !relationships_.count(outgoing_key) ||
-            relationships_[incoming_key].status != "pending_incoming" ||
-            relationships_[outgoing_key].status != "pending_outgoing") {
-            return error_response(409, "conflict", "No pending friend request to decline");
+        if (db_.enabled()) {
+            if (!db_.decline_friend_request(actor_user_id, target_user_id)) {
+                return error_response(409, "conflict", "No pending friend request to decline");
+            }
+        } else {
+            const auto incoming_key = pair_key(actor_user_id, target_user_id);
+            const auto outgoing_key = pair_key(target_user_id, actor_user_id);
+            if (!relationships_.count(incoming_key) || !relationships_.count(outgoing_key) ||
+                relationships_[incoming_key].status != "pending_incoming" ||
+                relationships_[outgoing_key].status != "pending_outgoing") {
+                return error_response(409, "conflict", "No pending friend request to decline");
+            }
+            set_relationship(actor_user_id, target_user_id, "declined");
+            set_relationship(target_user_id, actor_user_id, "declined");
         }
-        set_relationship(actor_user_id, target_user_id, "declined");
-        set_relationship(target_user_id, actor_user_id, "declined");
         audit("friend_request.decline", actor_user_id, target_user_id);
         increment_metric("friend_request.declined");
         return json_response(200, JsonObject{{"status", "declined"}, {"targetUserId", target_user_id}});
@@ -2361,16 +2675,25 @@ private:
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(target_user_id);
-        const auto relationship_before = relationship_state_before(actor_user_id, target_user_id);
-        const bool friend_edge_exists = is_friend(actor_user_id, target_user_id);
+        const auto relationship_before = db_.enabled()
+            ? db_.get_relationship_status(actor_user_id, target_user_id).value_or("none")
+            : relationship_state_before(actor_user_id, target_user_id);
+        const bool friend_edge_exists = db_.enabled() ? db_.are_friends(actor_user_id, target_user_id) : is_friend(actor_user_id, target_user_id);
         if (!friend_edge_exists) {
             log_friend_remove_decision("409", actor_user_id, target_user_id, "deny", "not_friends", relationship_before, false, "0");
             return error_response(409, "conflict", "Users are not friends");
         }
-        set_relationship(actor_user_id, target_user_id, "removed");
-        set_relationship(target_user_id, actor_user_id, "removed");
+        if (db_.enabled()) {
+            if (!db_.remove_friend(actor_user_id, target_user_id)) {
+                log_friend_remove_decision("409", actor_user_id, target_user_id, "deny", "not_friends", relationship_before, false, "0");
+                return error_response(409, "conflict", "Users are not friends");
+            }
+        } else {
+            set_relationship(actor_user_id, target_user_id, "removed");
+            set_relationship(target_user_id, actor_user_id, "removed");
+            publish_event("user.friend_removed", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
+        }
         log_friend_remove_decision("200", actor_user_id, target_user_id, "allow", "friend_removed", relationship_before, true, "1");
-        publish_event("user.friend_removed", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
         audit("friend.remove", actor_user_id, target_user_id);
         increment_metric("friend.removed");
         return json_response(200, JsonObject{{"status", "removed"}, {"targetUserId", target_user_id}});
