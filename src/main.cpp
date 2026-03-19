@@ -58,6 +58,10 @@ std::string trim(const std::string& input) {
     return input.substr(start, end - start);
 }
 
+std::string bool_string(const bool value) {
+    return value ? "true" : "false";
+}
+
 std::string to_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -610,6 +614,10 @@ std::string base64url_decode(std::string input) {
 struct JwtPrincipal {
     std::string raw_user_id;
     std::string canonical_id;
+    std::string subject;
+    std::optional<std::string> issuer;
+    std::optional<std::string> audience;
+    std::optional<long long> exp;
     std::optional<std::string> display_name;
 };
 
@@ -665,6 +673,10 @@ JwtPrincipal parse_jwt_without_signature_validation(
     return JwtPrincipal{
         .raw_user_id = raw_user_id,
         .canonical_id = canonical_user_id(raw_user_id),
+        .subject = required_string(payload, "sub"),
+        .issuer = optional_string(payload, "iss"),
+        .audience = required_audience,
+        .exp = payload.count("exp") != 0 && payload.at("exp").is_number() ? std::optional<long long>(static_cast<long long>(payload.at("exp").as_number())) : std::nullopt,
         .display_name = optional_string(payload, "name"),
     };
 }
@@ -1064,10 +1076,18 @@ class ServiceState {
 public:
     Response handle(const Request& request) {
         std::lock_guard<std::mutex> guard(mutex_);
+        current_request_method_ = request.method;
+        current_request_path_ = request.path;
+        current_request_id_ = request_id_for(request);
+        current_jwt_principal_.reset();
         try {
-            return route(request);
+            auto response = route(request);
+            reset_request_context();
+            return response;
         } catch (const std::exception& ex) {
-            return error_response(400, "bad_request", ex.what());
+            auto response = error_response(400, "bad_request", ex.what());
+            reset_request_context();
+            return response;
         }
     }
 
@@ -1086,6 +1106,216 @@ private:
     std::vector<JsonObject> audit_log_;
     std::set<std::string> processed_event_ids_;
     std::unordered_map<std::string, int> metrics_;
+    std::string current_request_id_ = "-";
+    std::string current_request_method_ = "-";
+    std::string current_request_path_ = "-";
+    std::optional<JwtPrincipal> current_jwt_principal_;
+
+    void reset_request_context() {
+        current_request_id_ = "-";
+        current_request_method_ = "-";
+        current_request_path_ = "-";
+        current_jwt_principal_.reset();
+    }
+
+    std::string request_id_for(const Request& request) const {
+        const auto it = request.headers.find("x-request-id");
+        if (it != request.headers.end() && !trim(it->second).empty()) {
+            return trim(it->second);
+        }
+        std::ostringstream oss;
+        oss << "req-" << std::hex << reinterpret_cast<std::uintptr_t>(&request);
+        return oss.str();
+    }
+
+    static std::string sanitize_log_value(std::string value) {
+        if (value.empty()) {
+            return "-";
+        }
+        for (char& ch : value) {
+            if (std::isspace(static_cast<unsigned char>(ch)) != 0 || ch == '=') {
+                ch = '_';
+            }
+        }
+        return value;
+    }
+
+    static std::string optional_log_value(const std::optional<std::string>& value) {
+        return value.has_value() ? sanitize_log_value(*value) : "-";
+    }
+
+    static std::string optional_log_value(const std::optional<long long>& value) {
+        return value.has_value() ? std::to_string(*value) : "-";
+    }
+
+    std::string current_actor_for_log() const {
+        return current_jwt_principal_.has_value() ? sanitize_log_value(current_jwt_principal_->canonical_id) : "-";
+    }
+
+    void log_event(
+        const std::string& phase,
+        const std::string& status,
+        const std::string& actor_user_id,
+        const std::string& target_user_id,
+        const std::string& decision,
+        const std::string& reason,
+        const std::vector<std::pair<std::string, std::string>>& extra = {}) const {
+        std::ostringstream oss;
+        oss << "phase=" << sanitize_log_value(phase)
+            << " method=" << sanitize_log_value(current_request_method_)
+            << " path=" << sanitize_log_value(current_request_path_)
+            << " status=" << sanitize_log_value(status)
+            << " requestId=" << sanitize_log_value(current_request_id_)
+            << " actorUserId=" << sanitize_log_value(actor_user_id)
+            << " targetUserId=" << sanitize_log_value(target_user_id)
+            << " decision=" << sanitize_log_value(decision)
+            << " reason=" << sanitize_log_value(reason);
+        for (const auto& [key, value] : extra) {
+            oss << ' ' << sanitize_log_value(key) << '=' << sanitize_log_value(value);
+        }
+        std::cout << oss.str() << "\n";
+    }
+
+    void log_auth_start(const Request& request, const bool auth_header_present, const bool bearer_present) const {
+        const auto forwarded = request.headers.find("x-forwarded-for");
+        const auto real_ip = request.headers.find("x-real-ip");
+        log_event(
+            "user.auth.start",
+            "-",
+            "-",
+            "-",
+            "info",
+            "-",
+            {
+                {"authHeaderPresent", bool_string(auth_header_present)},
+                {"bearerPresent", bool_string(bearer_present)},
+                {"xForwardedFor", forwarded != request.headers.end() ? trim(forwarded->second) : "-"},
+                {"xRealIp", real_ip != request.headers.end() ? trim(real_ip->second) : "-"},
+            });
+    }
+
+    void log_auth_result(
+        const std::string& status,
+        const std::string& actor_user_id,
+        const std::string& decision,
+        const std::string& reason,
+        const std::optional<JwtPrincipal>& principal,
+        const bool auth_header_present,
+        const bool bearer_present,
+        const bool token_parse_ok) const {
+        log_event(
+            "user.auth.result",
+            status,
+            actor_user_id,
+            "-",
+            decision,
+            reason,
+            {
+                {"authHeaderPresent", bool_string(auth_header_present)},
+                {"bearerPresent", bool_string(bearer_present)},
+                {"tokenParseOk", bool_string(token_parse_ok)},
+                {"tokenSignatureValid", principal.has_value() ? "not_checked" : "false"},
+                {"tokenSub", principal.has_value() ? principal->subject : "-"},
+                {"tokenUserId", principal.has_value() ? principal->canonical_id : "-"},
+                {"tokenIssuer", principal.has_value() ? optional_log_value(principal->issuer) : "-"},
+                {"tokenAudience", principal.has_value() ? optional_log_value(principal->audience) : "-"},
+                {"tokenExp", principal.has_value() ? optional_log_value(principal->exp) : "-"},
+                {"now", std::to_string(std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count())},
+            });
+    }
+
+    void log_privacy_resolution(
+        const std::string& actor_user_id,
+        const std::string& target_user_id,
+        const std::string& policy_type,
+        const std::string& decision,
+        const std::string& reason,
+        const std::string& actor_privacy_exists,
+        const std::string& target_privacy_exists,
+        const std::string& resolved_policy,
+        const std::string& mutuals_satisfied = "-") const {
+        log_event(
+            "user.privacy.resolve",
+            "-",
+            actor_user_id,
+            target_user_id,
+            decision,
+            reason,
+            {
+                {"policyType", policy_type},
+                {"actorPrivacyExists", actor_privacy_exists},
+                {"targetPrivacyExists", target_privacy_exists},
+                {"resolvedPolicy", resolved_policy},
+                {"mutualsSatisfied", mutuals_satisfied},
+            });
+    }
+
+    void log_friend_request_decision(
+        const std::string& status,
+        const std::string& actor_user_id,
+        const std::string& target_user_id,
+        const std::string& decision,
+        const std::string& reason,
+        const std::string& relationship_state_before,
+        const bool is_already_friend,
+        const bool has_pending_outgoing,
+        const bool has_pending_incoming,
+        const std::string& target_policy,
+        const std::string& rows_inserted) const {
+        log_event(
+            "user.friend_request.create",
+            status,
+            actor_user_id,
+            target_user_id,
+            decision,
+            reason,
+            {
+                {"relationshipStateBefore", relationship_state_before},
+                {"isAlreadyFriend", bool_string(is_already_friend)},
+                {"hasPendingOutgoing", bool_string(has_pending_outgoing)},
+                {"hasPendingIncoming", bool_string(has_pending_incoming)},
+                {"targetFriendRequestPolicy", target_policy},
+                {"rowsInserted", rows_inserted},
+            });
+    }
+
+    void log_friend_remove_decision(
+        const std::string& status,
+        const std::string& actor_user_id,
+        const std::string& target_user_id,
+        const std::string& decision,
+        const std::string& reason,
+        const std::string& relationship_state_before,
+        const bool friend_edge_exists,
+        const std::string& rows_deleted) const {
+        log_event(
+            "user.friend.remove",
+            status,
+            actor_user_id,
+            target_user_id,
+            decision,
+            reason,
+            {
+                {"relationshipStateBefore", relationship_state_before},
+                {"friendEdgeExists", bool_string(friend_edge_exists)},
+                {"rowsDeleted", rows_deleted},
+            });
+    }
+
+    std::string relationship_state_before(const std::string& actor_user_id, const std::string& target_user_id) const {
+        const auto it = relationships_.find(pair_key(actor_user_id, target_user_id));
+        return it == relationships_.end() ? "none" : it->second.status;
+    }
+
+    bool has_pending_outgoing(const std::string& actor_user_id, const std::string& target_user_id) const {
+        const auto it = relationships_.find(pair_key(actor_user_id, target_user_id));
+        return it != relationships_.end() && it->second.status == "pending_outgoing";
+    }
+
+    bool has_pending_incoming(const std::string& actor_user_id, const std::string& target_user_id) const {
+        const auto it = relationships_.find(pair_key(actor_user_id, target_user_id));
+        return it != relationships_.end() && it->second.status == "pending_incoming";
+    }
 
     Response route(const Request& request) {
         if (request.method == "GET" && request.path == "/healthz") {
@@ -1216,26 +1446,55 @@ private:
         ++metrics_[key];
     }
 
-    std::string require_actor_user_id(const Request& request) const {
+    std::string require_actor_user_id(const Request& request) {
         const auto it = request.headers.find("authorization");
+        const bool auth_header_present = it != request.headers.end();
+        std::string raw_header = auth_header_present ? trim(it->second) : "";
+        const std::string header = to_lower(raw_header);
+        const bool bearer_present = header.rfind("bearer ", 0) == 0;
+        log_auth_start(request, auth_header_present, bearer_present);
         if (it == request.headers.end()) {
+            log_auth_result("400", "-", "deny", "missing_bearer", std::nullopt, false, false, false);
             throw std::runtime_error("Missing Authorization header");
         }
-        const std::string raw_header = trim(it->second);
         const std::string prefix = "bearer user:";
-        const std::string header = to_lower(raw_header);
         if (header.rfind(prefix, 0) == 0) {
-            return trim(raw_header.substr(prefix.size()));
+            const auto actor_user_id = canonical_user_id(trim(raw_header.substr(prefix.size())));
+            log_auth_result("200", actor_user_id, "allow", "ok", std::nullopt, true, true, true);
+            return actor_user_id;
         }
         const std::string bearer_prefix = "bearer ";
         if (header.rfind(bearer_prefix, 0) != 0) {
+            log_auth_result("400", "-", "deny", "missing_bearer", std::nullopt, true, false, false);
             throw std::runtime_error("Expected Authorization: Bearer <jwt> or Bearer user:<user-id>");
         }
-        const auto principal = parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_);
-        return principal.canonical_id;
+        std::optional<JwtPrincipal> principal;
+        try {
+            principal = parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_);
+        } catch (const std::exception& ex) {
+            std::string reason = "claims_mismatch";
+            const std::string message = ex.what();
+            if (message.find("issuer mismatch") != std::string::npos) {
+                reason = "bad_issuer";
+            } else if (message.find("audience mismatch") != std::string::npos) {
+                reason = "bad_audience";
+            } else if (message.find("expired") != std::string::npos) {
+                reason = "expired";
+            } else if (message.find("Malformed JWT") != std::string::npos || message.find("base64url") != std::string::npos) {
+                reason = "bad_signature";
+            }
+            log_auth_result("400", "-", "deny", reason, std::nullopt, true, true, false);
+            throw;
+        }
+        current_jwt_principal_ = principal;
+        log_auth_result("200", principal->canonical_id, "allow", "ok", principal, true, true, true);
+        return principal->canonical_id;
     }
 
-    std::optional<std::string> actor_display_name_from_jwt(const Request& request) const {
+    std::optional<std::string> actor_display_name_from_jwt(const Request& request) {
+        if (current_jwt_principal_.has_value()) {
+            return current_jwt_principal_->display_name;
+        }
         const auto it = request.headers.find("authorization");
         if (it == request.headers.end()) {
             return std::nullopt;
@@ -1519,56 +1778,70 @@ private:
     bool authorize_dm_action_db(const std::string& actor_user_id, const std::string& target_user_id, std::string& reason) {
         if (actor_user_id == target_user_id) {
             reason = "self_dm_not_supported";
+            log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "-", "-");
             return false;
         }
         const auto summary = db_relationship_summary(actor_user_id, target_user_id);
         if (summary.is_blocked) {
             reason = "blocked_by_actor";
+            log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "-", "-");
             return false;
         }
         if (summary.is_blocked_by_target) {
             reason = "blocked_by_target";
+            log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "-", "-");
             return false;
         }
         const auto profile = ensure_db_profile_exists_and_load(target_user_id, std::nullopt);
         if (required_string(profile, "profileStatus") != "active") {
             reason = "target_inactive";
+            log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "-", "-");
             return false;
         }
         const auto settings = ensure_db_privacy_exists_and_load(target_user_id);
         const auto dm_policy = required_string(settings, "dmPolicy");
         if (dm_policy == "everyone") {
             reason.clear();
+            log_privacy_resolution(actor_user_id, target_user_id, "dm", "allow", "policy_resolved", "-", "true", dm_policy);
             return true;
         }
         if (dm_policy == "friends_only" && summary.is_friend) {
             reason.clear();
+            log_privacy_resolution(actor_user_id, target_user_id, "dm", "allow", "policy_resolved", "-", "true", dm_policy);
             return true;
         }
         reason = "dm_policy_denied";
+        log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "true", dm_policy);
         return false;
     }
 
     bool authorize_profile_read_db(const std::string& actor_user_id, const std::string& target_user_id) {
         if (actor_user_id == target_user_id) {
+            log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "allow", "policy_resolved", "-", "-", "self");
             return true;
         }
         const auto summary = db_relationship_summary(actor_user_id, target_user_id);
         if (summary.is_blocked || summary.is_blocked_by_target) {
+            log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "deny", "blocked", "-", "-", "-");
             return false;
         }
         const auto profile = ensure_db_profile_exists_and_load(target_user_id, std::nullopt);
         if (required_string(profile, "profileStatus") != "active") {
+            log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "deny", "target_inactive", "-", "-", "-");
             return false;
         }
         const auto settings = ensure_db_privacy_exists_and_load(target_user_id);
         const auto profile_visibility = required_string(settings, "profileVisibility");
         if (profile_visibility == "public") {
+            log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "allow", "policy_resolved", "-", "true", profile_visibility);
             return true;
         }
         if (profile_visibility == "friends_only") {
-            return summary.is_friend;
+            const auto allowed = summary.is_friend;
+            log_privacy_resolution(actor_user_id, target_user_id, "profile_read", allowed ? "allow" : "deny", allowed ? "policy_resolved" : "profile_visibility_denied", "-", "true", profile_visibility);
+            return allowed;
         }
+        log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "deny", "profile_visibility_denied", "-", "true", profile_visibility);
         return false;
     }
 
@@ -1576,22 +1849,33 @@ private:
         const auto summary = relationship_summary(actor_user_id, target_user_id);
         if (summary.is_blocked || summary.is_blocked_by_target) {
             reason = "blocked";
+            log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", reason, bool_string(privacy_.count(actor_user_id) != 0), bool_string(privacy_.count(target_user_id) != 0), "-");
             return false;
+        }
+        const auto target_privacy_exists = privacy_.count(target_user_id) != 0;
+        if (!target_privacy_exists) {
+            log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "error", "target_privacy_missing", bool_string(privacy_.count(actor_user_id) != 0), "false", "-");
         }
         const auto& settings = require_privacy_const(target_user_id);
         if (settings.friend_request_policy == "everyone") {
             reason.clear();
+            log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "allow", "policy_resolved", bool_string(privacy_.count(actor_user_id) != 0), "true", settings.friend_request_policy, "-");
             return true;
         }
         if (settings.friend_request_policy == "mutuals_only") {
             for (const auto& [key, relation] : relationships_) {
                 if (relation.user_id == actor_user_id && relation.status == "accepted" && is_friend(target_user_id, relation.target_user_id)) {
                     reason.clear();
+                    log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "allow", "policy_resolved", bool_string(privacy_.count(actor_user_id) != 0), "true", settings.friend_request_policy, "true");
                     return true;
                 }
             }
+            log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", "friend_request_policy_denied", bool_string(privacy_.count(actor_user_id) != 0), "true", settings.friend_request_policy, "false");
         }
         reason = "friend_request_policy_denied";
+        if (settings.friend_request_policy != "mutuals_only") {
+            log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", reason, bool_string(privacy_.count(actor_user_id) != 0), "true", settings.friend_request_policy, "-");
+        }
         return false;
     }
 
@@ -1999,18 +2283,27 @@ private:
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(target_user_id);
+        const auto relationship_before = relationship_state_before(actor_user_id, target_user_id);
+        const bool already_friend = is_friend(actor_user_id, target_user_id);
+        const bool pending_outgoing = has_pending_outgoing(actor_user_id, target_user_id);
+        const bool pending_incoming = has_pending_incoming(actor_user_id, target_user_id);
+        const std::string target_policy = privacy_.count(target_user_id) != 0 ? privacy_.at(target_user_id).friend_request_policy : "-";
         if (actor_user_id == target_user_id) {
+            log_friend_request_decision("400", actor_user_id, target_user_id, "deny", "self_friend_not_supported", relationship_before, already_friend, pending_outgoing, pending_incoming, target_policy, "0");
             return error_response(400, "bad_request", "Cannot friend yourself");
         }
         std::string reason;
         if (!allows_friend_request(actor_user_id, target_user_id, reason)) {
+            log_friend_request_decision("403", actor_user_id, target_user_id, "deny", reason, relationship_before, already_friend, pending_outgoing, pending_incoming, target_policy, "0");
             return error_response(403, "forbidden", reason);
         }
-        if (is_friend(actor_user_id, target_user_id)) {
+        if (already_friend) {
+            log_friend_request_decision("409", actor_user_id, target_user_id, "deny", "already_friends", relationship_before, already_friend, pending_outgoing, pending_incoming, target_policy, "0");
             return error_response(409, "conflict", "Users are already friends");
         }
         set_relationship(actor_user_id, target_user_id, "pending_outgoing");
         set_relationship(target_user_id, actor_user_id, "pending_incoming");
+        log_friend_request_decision("201", actor_user_id, target_user_id, "allow", "created", relationship_before, already_friend, pending_outgoing, pending_incoming, target_policy, "1");
         publish_event("user.friend_request_created", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
         audit("friend_request.create", actor_user_id, target_user_id);
         increment_metric("friend_request.created");
@@ -2058,11 +2351,15 @@ private:
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(target_user_id);
-        if (!is_friend(actor_user_id, target_user_id)) {
+        const auto relationship_before = relationship_state_before(actor_user_id, target_user_id);
+        const bool friend_edge_exists = is_friend(actor_user_id, target_user_id);
+        if (!friend_edge_exists) {
+            log_friend_remove_decision("409", actor_user_id, target_user_id, "deny", "not_friends", relationship_before, false, "0");
             return error_response(409, "conflict", "Users are not friends");
         }
         set_relationship(actor_user_id, target_user_id, "removed");
         set_relationship(target_user_id, actor_user_id, "removed");
+        log_friend_remove_decision("200", actor_user_id, target_user_id, "allow", "friend_removed", relationship_before, true, "1");
         publish_event("user.friend_removed", JsonObject{{"userId", actor_user_id}, {"targetUserId", target_user_id}});
         audit("friend.remove", actor_user_id, target_user_id);
         increment_metric("friend.removed");
