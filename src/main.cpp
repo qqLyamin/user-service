@@ -2379,16 +2379,45 @@ private:
         return canonical_user_id(path.substr(prefix.size(), path.size() - prefix.size() - suffix.size()));
     }
 
+    std::string normalize_relationship_action(const JsonObject& object) const {
+        if (const auto action = optional_string(object, "action")) {
+            return *action;
+        }
+        if (const auto policy_type = optional_string(object, "policyType")) {
+            if (*policy_type == "dm") {
+                return "dm.start";
+            }
+            if (*policy_type == "friend_request") {
+                return "friend.request.send";
+            }
+            if (*policy_type == "profile_read") {
+                return "profile.read";
+            }
+            if (*policy_type == "friendship") {
+                return "friendship.status";
+            }
+            if (*policy_type == "block") {
+                return "block.status";
+            }
+            throw std::runtime_error("Unsupported policyType: " + *policy_type);
+        }
+        throw std::runtime_error("Missing string field: action");
+    }
+
     Response internal_relationship_check(const Request& request) {
         require_internal_token(request);
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
         const std::string actor_user_id = canonical_user_id(required_string(object, "actorUserId"));
         const std::string target_user_id = canonical_user_id(required_string(object, "targetUserId"));
-        const std::string action = required_string(object, "action");
+        const std::string action = normalize_relationship_action(object);
 
         ensure_profile_exists(actor_user_id);
         ensure_profile_exists(target_user_id);
+
+        const auto summary = db_.enabled()
+            ? db_relationship_summary(actor_user_id, target_user_id)
+            : relationship_summary(actor_user_id, target_user_id);
 
         bool allowed = false;
         std::string reason;
@@ -2407,13 +2436,19 @@ private:
             allowed = db_.enabled()
                 ? allows_friend_request_db(actor_user_id, target_user_id, reason)
                 : allows_friend_request(actor_user_id, target_user_id, reason);
+        } else if (action == "friendship.status") {
+            allowed = summary.is_friend;
+            if (!allowed) {
+                reason = "not_friends";
+            }
+        } else if (action == "block.status") {
+            allowed = !(summary.is_blocked || summary.is_blocked_by_target);
+            if (!allowed) {
+                reason = summary.is_blocked ? "blocked_by_actor" : "blocked_by_target";
+            }
         } else {
             throw std::runtime_error("Unsupported action: " + action);
         }
-
-        const auto summary = db_.enabled()
-            ? db_relationship_summary(actor_user_id, target_user_id)
-            : relationship_summary(actor_user_id, target_user_id);
         return json_response(200, JsonObject{
             {"allowed", allowed},
             {"reason", reason.empty() ? Json(nullptr) : Json(reason)},
