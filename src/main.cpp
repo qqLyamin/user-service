@@ -423,6 +423,16 @@ struct RelationshipRecord {
     std::string updated_at;
 };
 
+struct RelationshipListItem {
+    std::string user_id;
+    std::string display_name;
+    std::optional<std::string> username;
+    std::string profile_status;
+    std::string relation_status;
+    std::string created_at;
+    std::string updated_at;
+};
+
 struct BlockRecord {
     std::string user_id;
     std::string target_user_id;
@@ -968,6 +978,48 @@ public:
             "AND target_user_id='" + shell_escape_single_quotes(target_user_id) + "' "
             "AND relation_type='friend' LIMIT 1;";
         return query_scalar(sql);
+    }
+
+    std::vector<RelationshipListItem> list_relationships(const std::string& user_id, const std::string& status, const int limit, const int offset) const {
+        if (!enabled_) {
+            return {};
+        }
+        std::ostringstream sql;
+        sql << "SELECT p.user_id::text, p.display_name, COALESCE(p.username, ''), p.profile_status, "
+            << "r.status, "
+            << "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
+            << "to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') "
+            << "FROM user_relationships r "
+            << "JOIN user_profiles p ON p.user_id=r.target_user_id "
+            << "WHERE r.user_id='" << shell_escape_single_quotes(user_id) << "' "
+            << "AND r.relation_type='friend' "
+            << "AND r.status='" << shell_escape_single_quotes(status) << "' "
+            << "AND NOT EXISTS (SELECT 1 FROM user_blocks b "
+            << "WHERE (b.user_id='" << shell_escape_single_quotes(user_id) << "' AND b.target_user_id=r.target_user_id) "
+            << "OR (b.user_id=r.target_user_id AND b.target_user_id='" << shell_escape_single_quotes(user_id) << "')) "
+            << "ORDER BY r.updated_at DESC "
+            << "LIMIT " << std::max(limit, 0) << " OFFSET " << std::max(offset, 0) << ";";
+        const auto rows = query_rows(sql.str());
+        if (!rows.has_value()) {
+            return {};
+        }
+        std::vector<RelationshipListItem> items;
+        items.reserve(rows->size());
+        for (const auto& row : *rows) {
+            if (row.size() != 7U) {
+                throw std::runtime_error("Unexpected relationship list row shape");
+            }
+            items.push_back(RelationshipListItem{
+                .user_id = row[0],
+                .display_name = row[1],
+                .username = row[2].empty() ? std::nullopt : std::optional<std::string>(row[2]),
+                .profile_status = row[3],
+                .relation_status = row[4],
+                .created_at = row[5],
+                .updated_at = row[6],
+            });
+        }
+        return items;
     }
 
     bool has_mutual_friend(const std::string& user_id, const std::string& target_user_id) const {
@@ -1675,8 +1727,17 @@ private:
         if (request.method == "GET" && request.path == "/v1/users/me/conversations") {
             return list_projection_entities(request, "conversation");
         }
+        if (request.method == "GET" && request.path == "/v1/users/me/friends") {
+            return list_relationship_collection(request, "accepted", "friend.list");
+        }
         if (request.method == "GET" && request.path == "/v1/users/me/contacts") {
-            return list_contacts(request);
+            return list_relationship_collection(request, "accepted", "contact.list");
+        }
+        if (request.method == "GET" && request.path == "/v1/users/me/friend-requests/incoming") {
+            return list_relationship_collection(request, "pending_incoming", "friend_request.list.incoming");
+        }
+        if (request.method == "GET" && request.path == "/v1/users/me/friend-requests/outgoing") {
+            return list_relationship_collection(request, "pending_outgoing", "friend_request.list.outgoing");
         }
         if (starts_with(request.path, "/v1/users/")) {
             return handle_user_scoped_route(request);
@@ -2857,37 +2918,53 @@ private:
         return json_response(200, JsonObject{{"items", items}, {"limit", limit}, {"offset", offset}});
     }
 
-    Response list_contacts(const Request& request) {
+    Response list_relationship_collection(const Request& request, const std::string& status, const std::string& metric_name) {
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
         const int limit = parse_int_query(request.query, "limit", 50);
         const int offset = parse_int_query(request.query, "offset", 0);
 
         JsonArray items;
-        int seen = 0;
-        for (const auto& [key, relation] : relationships_) {
-            if (relation.user_id != actor_user_id || relation.status != "accepted") {
-                continue;
+        if (db_.enabled()) {
+            for (const auto& item : db_.list_relationships(actor_user_id, status, limit, offset)) {
+                items.emplace_back(JsonObject{
+                    {"userId", item.user_id},
+                    {"displayName", item.display_name},
+                    {"username", item.username.has_value() ? Json(*item.username) : Json(nullptr)},
+                    {"profileStatus", item.profile_status},
+                    {"relationStatus", item.relation_status},
+                    {"createdAt", item.created_at},
+                    {"updatedAt", item.updated_at},
+                });
             }
-            if (has_block(actor_user_id, relation.target_user_id) || has_block(relation.target_user_id, actor_user_id)) {
-                continue;
+        } else {
+            int seen = 0;
+            for (const auto& [key, relation] : relationships_) {
+                if (relation.user_id != actor_user_id || relation.status != status) {
+                    continue;
+                }
+                if (has_block(actor_user_id, relation.target_user_id) || has_block(relation.target_user_id, actor_user_id)) {
+                    continue;
+                }
+                if (seen++ < offset) {
+                    continue;
+                }
+                if (static_cast<int>(items.size()) >= limit) {
+                    break;
+                }
+                const auto& profile = require_profile_const(relation.target_user_id);
+                items.emplace_back(JsonObject{
+                    {"userId", profile.user_id},
+                    {"displayName", profile.display_name},
+                    {"username", profile.username.has_value() ? Json(*profile.username) : Json(nullptr)},
+                    {"profileStatus", profile.profile_status},
+                    {"relationStatus", relation.status},
+                    {"createdAt", relation.created_at},
+                    {"updatedAt", relation.updated_at},
+                });
             }
-            if (seen++ < offset) {
-                continue;
-            }
-            if (static_cast<int>(items.size()) >= limit) {
-                break;
-            }
-            const auto& profile = require_profile_const(relation.target_user_id);
-            items.emplace_back(JsonObject{
-                {"userId", profile.user_id},
-                {"displayName", profile.display_name},
-                {"username", profile.username.has_value() ? Json(*profile.username) : Json(nullptr)},
-                {"profileStatus", profile.profile_status},
-                {"relationStatus", relation.status},
-            });
         }
-        increment_metric("contact.list");
+        increment_metric(metric_name);
         return json_response(200, JsonObject{{"items", items}, {"limit", limit}, {"offset", offset}});
     }
 };

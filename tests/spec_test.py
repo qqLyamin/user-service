@@ -148,9 +148,18 @@ def main() -> int:
         contacts = request("GET", "/v1/users/me/contacts?limit=10&offset=0", user_id=alice)
         assert len(contacts["items"]) == 1
         assert contacts["items"][0]["userId"] == bob
+        friends = request("GET", "/v1/users/me/friends?limit=10&offset=0", user_id=alice)
+        assert len(friends["items"]) == 1
+        assert friends["items"][0]["userId"] == bob
 
         declined = request("POST", f"/v1/users/{charlie}/friend-request", user_id=bob, expected_status=201)
         assert declined["status"] == "pending"
+        outgoing = request("GET", "/v1/users/me/friend-requests/outgoing?limit=10&offset=0", user_id=bob)
+        assert len(outgoing["items"]) == 1
+        assert outgoing["items"][0]["userId"] == charlie
+        incoming = request("GET", "/v1/users/me/friend-requests/incoming?limit=10&offset=0", user_id=charlie)
+        assert len(incoming["items"]) == 1
+        assert incoming["items"][0]["userId"] == bob
         decline_result = request("POST", f"/v1/users/{bob}/friend-request/decline", user_id=charlie)
         assert decline_result["status"] == "declined"
 
