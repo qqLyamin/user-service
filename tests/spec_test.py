@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import hmac
 import json
 import os
 import socket
@@ -15,7 +18,27 @@ EXE = BUILD_DIR / "user-service.exe"
 if not EXE.exists():
     EXE = BUILD_DIR / "user-service"
 BASE_URL = "http://127.0.0.1:18080"
-INTERNAL_TOKEN = "internal-secret"
+INTERNAL_JWT_SECRET = "test-secret"
+INTERNAL_JWT_ISSUER = "auth-service"
+INTERNAL_JWT_AUDIENCE = "internal"
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def make_internal_token(secret: str, subject: str = "signaling") -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {
+        "iss": INTERNAL_JWT_ISSUER,
+        "sub": subject,
+        "aud": [INTERNAL_JWT_AUDIENCE],
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 300,
+    }
+    signing_input = f"{b64url(json.dumps(header, separators=(',', ':')).encode())}.{b64url(json.dumps(payload, separators=(',', ':')).encode())}"
+    signature = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
+    return f"{signing_input}.{b64url(signature)}"
 
 
 def wait_for_port(host: str, port: int, timeout: float = 10.0) -> None:
@@ -29,12 +52,12 @@ def wait_for_port(host: str, port: int, timeout: float = 10.0) -> None:
     raise RuntimeError(f"service did not start on {host}:{port}")
 
 
-def request(method: str, path: str, body=None, user_id=None, internal=False, expected_status=200):
+def request(method: str, path: str, body=None, user_id=None, internal=False, internal_token=None, expected_status=200):
     headers = {"Content-Type": "application/json"}
     if user_id is not None:
         headers["Authorization"] = f"Bearer user:{user_id}"
     if internal:
-        headers["X-Internal-Token"] = INTERNAL_TOKEN
+        headers["Authorization"] = f"Bearer {internal_token or make_internal_token(INTERNAL_JWT_SECRET)}"
     payload = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(f"{BASE_URL}{path}", data=payload, method=method, headers=headers)
     try:
@@ -65,9 +88,21 @@ def main() -> int:
 
     env = os.environ.copy()
     env["USER_SERVICE_PORT"] = "18080"
+    env["JWT_SECRET"] = INTERNAL_JWT_SECRET
+    env["JWT_ISSUER"] = INTERNAL_JWT_ISSUER
+    env["JWT_AUDIENCE"] = INTERNAL_JWT_AUDIENCE
     proc = subprocess.Popen([str(EXE)], cwd=str(ROOT), env=env)
     try:
         wait_for_port("127.0.0.1", 18080)
+
+        invalid_internal_auth = request(
+            "GET",
+            "/internal/metrics",
+            internal=True,
+            internal_token=make_internal_token("wrong-secret"),
+            expected_status=401,
+        )
+        assert invalid_internal_auth["error"] == "unauthorized"
 
         alice = "11111111-1111-1111-1111-111111111111"
         bob = "22222222-2222-2222-2222-222222222222"

@@ -491,6 +491,11 @@ struct RelationshipSummary {
     bool is_blocked_by_target = false;
 };
 
+struct AuthorizationDecision {
+    bool allowed = false;
+    std::string reason;
+};
+
 std::string pair_key(const std::string& lhs, const std::string& rhs) {
     return lhs + "|" + rhs;
 }
@@ -1446,6 +1451,9 @@ private:
     std::optional<std::string> jwt_issuer_ = get_env("JWT_ISSUER");
     std::optional<std::string> jwt_audience_ = get_env("JWT_AUDIENCE");
     std::optional<std::string> jwt_secret_ = get_env("JWT_SECRET");
+    std::optional<std::string> internal_jwt_issuer_ = get_env("INTERNAL_JWT_ISSUER");
+    std::optional<std::string> internal_jwt_audience_ = get_env("INTERNAL_JWT_AUDIENCE");
+    std::optional<std::string> internal_jwt_secret_ = get_env("INTERNAL_JWT_SECRET");
     std::optional<std::string> internal_token_ = get_env("INTERNAL_TOKEN");
     std::unordered_map<std::string, UserProfile> profiles_;
     std::unordered_map<std::string, PrivacySettings> privacy_;
@@ -1461,12 +1469,22 @@ private:
     std::string current_request_method_ = "-";
     std::string current_request_path_ = "-";
     std::optional<JwtPrincipal> current_jwt_principal_;
+    std::unordered_map<std::string, RelationshipSummary> request_relationship_summary_cache_;
+    std::unordered_map<std::string, JsonObject> request_db_profile_cache_;
+    std::unordered_map<std::string, JsonObject> request_db_privacy_cache_;
+    std::unordered_map<std::string, AuthorizationDecision> request_authorization_decision_cache_;
+    std::set<std::string> request_privacy_log_cache_;
 
     void reset_request_context() {
         current_request_id_ = "-";
         current_request_method_ = "-";
         current_request_path_ = "-";
         current_jwt_principal_.reset();
+        request_relationship_summary_cache_.clear();
+        request_db_profile_cache_.clear();
+        request_db_privacy_cache_.clear();
+        request_authorization_decision_cache_.clear();
+        request_privacy_log_cache_.clear();
     }
 
     std::string request_id_for(const Request& request) const {
@@ -1497,6 +1515,71 @@ private:
 
     static std::string optional_log_value(const std::optional<long long>& value) {
         return value.has_value() ? std::to_string(*value) : "-";
+    }
+
+    static std::string request_cache_key(const std::string& scope, const std::string& actor_user_id, const std::string& target_user_id) {
+        return scope + "|" + actor_user_id + "|" + target_user_id;
+    }
+
+    static std::string request_cache_key(const std::string& scope, const std::string& user_id) {
+        return scope + "|" + user_id;
+    }
+
+    std::optional<AuthorizationDecision> cached_authorization_decision(
+        const std::string& scope,
+        const std::string& actor_user_id,
+        const std::string& target_user_id) const {
+        const auto it = request_authorization_decision_cache_.find(request_cache_key(scope, actor_user_id, target_user_id));
+        if (it == request_authorization_decision_cache_.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+    AuthorizationDecision cache_authorization_decision(
+        const std::string& scope,
+        const std::string& actor_user_id,
+        const std::string& target_user_id,
+        const bool allowed,
+        const std::string& reason) {
+        const AuthorizationDecision decision{allowed, reason};
+        request_authorization_decision_cache_[request_cache_key(scope, actor_user_id, target_user_id)] = decision;
+        return decision;
+    }
+
+    std::optional<std::string> effective_internal_jwt_secret() const {
+        if (internal_jwt_secret_.has_value()) {
+            return internal_jwt_secret_;
+        }
+        return jwt_secret_;
+    }
+
+    std::optional<std::string> effective_internal_jwt_issuer() const {
+        return internal_jwt_issuer_.has_value() ? internal_jwt_issuer_ : std::optional<std::string>("auth-service");
+    }
+
+    std::optional<std::string> effective_internal_jwt_audience() const {
+        return internal_jwt_audience_.has_value() ? internal_jwt_audience_ : std::optional<std::string>("internal");
+    }
+
+    static std::string auth_failure_reason(const std::string& message) {
+        if (message.find("issuer mismatch") != std::string::npos) {
+            return "bad_issuer";
+        }
+        if (message.find("audience mismatch") != std::string::npos) {
+            return "bad_audience";
+        }
+        if (message.find("expired") != std::string::npos) {
+            return "expired";
+        }
+        if (message.find("signature mismatch") != std::string::npos ||
+            message.find("Malformed JWT") != std::string::npos ||
+            message.find("base64url") != std::string::npos ||
+            message.find("secret") != std::string::npos ||
+            message.find("alg") != std::string::npos) {
+            return "bad_signature";
+        }
+        return "claims_mismatch";
     }
 
     std::string current_actor_for_log() const {
@@ -1585,7 +1668,12 @@ private:
         const std::string& actor_privacy_exists,
         const std::string& target_privacy_exists,
         const std::string& resolved_policy,
-        const std::string& mutuals_satisfied = "-") const {
+        const std::string& mutuals_satisfied = "-") {
+        const std::string cache_key = actor_user_id + "|" + target_user_id + "|" + policy_type + "|" + decision + "|" + reason + "|" +
+                                      actor_privacy_exists + "|" + target_privacy_exists + "|" + resolved_policy + "|" + mutuals_satisfied;
+        if (!request_privacy_log_cache_.insert(cache_key).second) {
+            return;
+        }
         log_event(
             "user.privacy.resolve",
             "-",
@@ -1843,17 +1931,7 @@ private:
         try {
             principal = parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_, jwt_secret_);
         } catch (const std::exception& ex) {
-            std::string reason = "claims_mismatch";
-            const std::string message = ex.what();
-            if (message.find("issuer mismatch") != std::string::npos) {
-                reason = "bad_issuer";
-            } else if (message.find("audience mismatch") != std::string::npos) {
-                reason = "bad_audience";
-            } else if (message.find("expired") != std::string::npos) {
-                reason = "expired";
-            } else if (message.find("signature mismatch") != std::string::npos || message.find("Malformed JWT") != std::string::npos || message.find("base64url") != std::string::npos || message.find("secret") != std::string::npos || message.find("alg") != std::string::npos) {
-                reason = "bad_signature";
-            }
+            const std::string reason = auth_failure_reason(ex.what());
             log_auth_result("401", "-", "deny", reason, std::nullopt, "false", true, true, false);
             throw HttpError(401, "unauthorized", ex.what());
         }
@@ -1880,8 +1958,31 @@ private:
     }
 
     void require_internal_token(const Request& request) {
-        if (request.headers.find("authorization") != request.headers.end()) {
-            require_actor_user_id(request);
+        const auto auth_it = request.headers.find("authorization");
+        if (auth_it != request.headers.end()) {
+            const std::string raw_header = trim(auth_it->second);
+            const std::string header = to_lower(raw_header);
+            const bool bearer_present = header.rfind("bearer ", 0) == 0;
+            log_auth_start(request, true, bearer_present);
+            const std::string bearer_prefix = "bearer ";
+            if (header.rfind(bearer_prefix, 0) != 0 || header.rfind("bearer user:", 0) == 0) {
+                log_auth_result("401", "-", "deny", "missing_bearer", std::nullopt, "false", true, bearer_present, false);
+                throw HttpError(401, "unauthorized", "Expected Authorization: Bearer <jwt>");
+            }
+            std::optional<JwtPrincipal> principal;
+            try {
+                principal = parse_jwt_without_signature_validation(
+                    trim(raw_header.substr(bearer_prefix.size())),
+                    effective_internal_jwt_issuer(),
+                    effective_internal_jwt_audience(),
+                    effective_internal_jwt_secret());
+            } catch (const std::exception& ex) {
+                const std::string reason = auth_failure_reason(ex.what());
+                log_auth_result("401", "-", "deny", reason, std::nullopt, "false", true, true, false);
+                throw HttpError(401, "unauthorized", ex.what());
+            }
+            current_jwt_principal_ = principal;
+            log_auth_result("200", principal->canonical_id, "allow", "ok", principal, "true", true, true, true);
             return;
         }
         const auto it = request.headers.find("x-internal-token");
@@ -1923,22 +2024,30 @@ private:
         return it->second;
     }
 
-    JsonObject ensure_db_profile_exists_and_load(const std::string& user_id, const std::optional<std::string>& preferred_display_name) {
+    const JsonObject& ensure_db_profile_exists_and_load(const std::string& user_id, const std::optional<std::string>& preferred_display_name) {
+        const auto cache_it = request_db_profile_cache_.find(request_cache_key("db_profile", user_id));
+        if (cache_it != request_db_profile_cache_.end()) {
+            return cache_it->second;
+        }
         db_.ensure_profile_exists(user_id, preferred_display_name.value_or("User " + user_id.substr(0, std::min<std::size_t>(8, user_id.size()))));
         const auto profile = db_.get_profile(user_id);
         if (!profile.has_value()) {
             throw std::runtime_error("Failed to load DB profile after ensure");
         }
-        return *profile;
+        return request_db_profile_cache_.emplace(request_cache_key("db_profile", user_id), *profile).first->second;
     }
 
-    JsonObject ensure_db_privacy_exists_and_load(const std::string& user_id) {
+    const JsonObject& ensure_db_privacy_exists_and_load(const std::string& user_id) {
+        const auto cache_it = request_db_privacy_cache_.find(request_cache_key("db_privacy", user_id));
+        if (cache_it != request_db_privacy_cache_.end()) {
+            return cache_it->second;
+        }
         db_.ensure_profile_exists(user_id, "User " + user_id.substr(0, std::min<std::size_t>(8, user_id.size())));
         const auto settings = db_.get_privacy_settings(user_id);
         if (!settings.has_value()) {
             throw std::runtime_error("Failed to load DB privacy after ensure");
         }
-        return *settings;
+        return request_db_privacy_cache_.emplace(request_cache_key("db_privacy", user_id), *settings).first->second;
     }
 
     UserProfile& ensure_memory_profile_exists(const std::string& user_id, const std::optional<std::string>& preferred_display_name) {
@@ -1973,20 +2082,32 @@ private:
                lhs->second.status == "accepted" && rhs->second.status == "accepted";
     }
 
-    RelationshipSummary relationship_summary(const std::string& actor_user_id, const std::string& target_user_id) const {
-        return RelationshipSummary{
+    RelationshipSummary relationship_summary(const std::string& actor_user_id, const std::string& target_user_id) {
+        const auto cache_it = request_relationship_summary_cache_.find(request_cache_key("memory_relationship", actor_user_id, target_user_id));
+        if (cache_it != request_relationship_summary_cache_.end()) {
+            return cache_it->second;
+        }
+        const RelationshipSummary summary{
             .is_friend = is_friend(actor_user_id, target_user_id),
             .is_blocked = has_block(actor_user_id, target_user_id),
             .is_blocked_by_target = has_block(target_user_id, actor_user_id),
         };
+        request_relationship_summary_cache_[request_cache_key("memory_relationship", actor_user_id, target_user_id)] = summary;
+        return summary;
     }
 
-    RelationshipSummary db_relationship_summary(const std::string& actor_user_id, const std::string& target_user_id) const {
-        return RelationshipSummary{
+    RelationshipSummary db_relationship_summary(const std::string& actor_user_id, const std::string& target_user_id) {
+        const auto cache_it = request_relationship_summary_cache_.find(request_cache_key("db_relationship", actor_user_id, target_user_id));
+        if (cache_it != request_relationship_summary_cache_.end()) {
+            return cache_it->second;
+        }
+        const RelationshipSummary summary{
             .is_friend = db_.are_friends(actor_user_id, target_user_id),
             .is_blocked = db_.has_block(actor_user_id, target_user_id),
             .is_blocked_by_target = db_.has_block(target_user_id, actor_user_id),
         };
+        request_relationship_summary_cache_[request_cache_key("db_relationship", actor_user_id, target_user_id)] = summary;
+        return summary;
     }
 
     Json profile_to_json(const UserProfile& profile, bool include_private_fields) const {
@@ -2097,136 +2218,164 @@ private:
         audit_log_.push_back(record);
     }
 
-    bool authorize_profile_read(const std::string& actor_user_id, const std::string& target_user_id) const {
+    bool authorize_profile_read(const std::string& actor_user_id, const std::string& target_user_id) {
+        if (const auto cached = cached_authorization_decision("profile_read_memory", actor_user_id, target_user_id)) {
+            return cached->allowed;
+        }
         if (actor_user_id == target_user_id) {
-            return true;
+            return cache_authorization_decision("profile_read_memory", actor_user_id, target_user_id, true, "policy_resolved").allowed;
         }
         const auto summary = relationship_summary(actor_user_id, target_user_id);
         if (summary.is_blocked || summary.is_blocked_by_target) {
-            return false;
+            return cache_authorization_decision("profile_read_memory", actor_user_id, target_user_id, false, "blocked").allowed;
         }
         const auto& profile = require_profile_const(target_user_id);
         if (profile.profile_status != "active") {
-            return false;
+            return cache_authorization_decision("profile_read_memory", actor_user_id, target_user_id, false, "target_inactive").allowed;
         }
         const auto& settings = require_privacy_const(target_user_id);
         if (settings.profile_visibility == "public") {
-            return true;
+            return cache_authorization_decision("profile_read_memory", actor_user_id, target_user_id, true, "policy_resolved").allowed;
         }
         if (settings.profile_visibility == "friends_only") {
-            return summary.is_friend;
+            return cache_authorization_decision(
+                "profile_read_memory",
+                actor_user_id,
+                target_user_id,
+                summary.is_friend,
+                summary.is_friend ? "policy_resolved" : "profile_visibility_denied").allowed;
         }
-        return false;
+        return cache_authorization_decision("profile_read_memory", actor_user_id, target_user_id, false, "profile_visibility_denied").allowed;
     }
 
-    bool authorize_dm_start(const std::string& actor_user_id, const std::string& target_user_id, std::string& reason) const {
+    bool authorize_dm_start(const std::string& actor_user_id, const std::string& target_user_id, std::string& reason) {
+        if (const auto cached = cached_authorization_decision("dm_memory", actor_user_id, target_user_id)) {
+            reason = cached->reason;
+            return cached->allowed;
+        }
         if (actor_user_id == target_user_id) {
             reason = "self_dm_not_supported";
-            return false;
+            return cache_authorization_decision("dm_memory", actor_user_id, target_user_id, false, reason).allowed;
         }
         const auto summary = relationship_summary(actor_user_id, target_user_id);
         if (summary.is_blocked) {
             reason = "blocked_by_actor";
-            return false;
+            return cache_authorization_decision("dm_memory", actor_user_id, target_user_id, false, reason).allowed;
         }
         if (summary.is_blocked_by_target) {
             reason = "blocked_by_target";
-            return false;
+            return cache_authorization_decision("dm_memory", actor_user_id, target_user_id, false, reason).allowed;
         }
         const auto& profile = require_profile_const(target_user_id);
         if (profile.profile_status != "active") {
             reason = "target_inactive";
-            return false;
+            return cache_authorization_decision("dm_memory", actor_user_id, target_user_id, false, reason).allowed;
         }
         const auto& settings = require_privacy_const(target_user_id);
         if (settings.dm_policy == "everyone") {
             reason.clear();
-            return true;
+            return cache_authorization_decision("dm_memory", actor_user_id, target_user_id, true, reason).allowed;
         }
         if (settings.dm_policy == "friends_only" && summary.is_friend) {
             reason.clear();
-            return true;
+            return cache_authorization_decision("dm_memory", actor_user_id, target_user_id, true, reason).allowed;
         }
         reason = "dm_policy_denied";
-        return false;
+        return cache_authorization_decision("dm_memory", actor_user_id, target_user_id, false, reason).allowed;
     }
 
     bool authorize_dm_action_db(const std::string& actor_user_id, const std::string& target_user_id, std::string& reason) {
+        if (const auto cached = cached_authorization_decision("dm_db", actor_user_id, target_user_id)) {
+            reason = cached->reason;
+            return cached->allowed;
+        }
         if (actor_user_id == target_user_id) {
             reason = "self_dm_not_supported";
             log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "-", "-");
-            return false;
+            return cache_authorization_decision("dm_db", actor_user_id, target_user_id, false, reason).allowed;
         }
         const auto summary = db_relationship_summary(actor_user_id, target_user_id);
         if (summary.is_blocked) {
             reason = "blocked_by_actor";
             log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "-", "-");
-            return false;
+            return cache_authorization_decision("dm_db", actor_user_id, target_user_id, false, reason).allowed;
         }
         if (summary.is_blocked_by_target) {
             reason = "blocked_by_target";
             log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "-", "-");
-            return false;
+            return cache_authorization_decision("dm_db", actor_user_id, target_user_id, false, reason).allowed;
         }
-        const auto profile = ensure_db_profile_exists_and_load(target_user_id, std::nullopt);
+        const auto& profile = ensure_db_profile_exists_and_load(target_user_id, std::nullopt);
         if (required_string(profile, "profileStatus") != "active") {
             reason = "target_inactive";
             log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "-", "-");
-            return false;
+            return cache_authorization_decision("dm_db", actor_user_id, target_user_id, false, reason).allowed;
         }
-        const auto settings = ensure_db_privacy_exists_and_load(target_user_id);
+        const auto& settings = ensure_db_privacy_exists_and_load(target_user_id);
         const auto dm_policy = required_string(settings, "dmPolicy");
         if (dm_policy == "everyone") {
             reason.clear();
             log_privacy_resolution(actor_user_id, target_user_id, "dm", "allow", "policy_resolved", "-", "true", dm_policy);
-            return true;
+            return cache_authorization_decision("dm_db", actor_user_id, target_user_id, true, reason).allowed;
         }
         if (dm_policy == "friends_only" && summary.is_friend) {
             reason.clear();
             log_privacy_resolution(actor_user_id, target_user_id, "dm", "allow", "policy_resolved", "-", "true", dm_policy);
-            return true;
+            return cache_authorization_decision("dm_db", actor_user_id, target_user_id, true, reason).allowed;
         }
         reason = "dm_policy_denied";
         log_privacy_resolution(actor_user_id, target_user_id, "dm", "deny", reason, "-", "true", dm_policy);
-        return false;
+        return cache_authorization_decision("dm_db", actor_user_id, target_user_id, false, reason).allowed;
     }
 
     bool authorize_profile_read_db(const std::string& actor_user_id, const std::string& target_user_id) {
+        if (const auto cached = cached_authorization_decision("profile_read_db", actor_user_id, target_user_id)) {
+            return cached->allowed;
+        }
         if (actor_user_id == target_user_id) {
             log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "allow", "policy_resolved", "-", "-", "self");
-            return true;
+            return cache_authorization_decision("profile_read_db", actor_user_id, target_user_id, true, "policy_resolved").allowed;
         }
         const auto summary = db_relationship_summary(actor_user_id, target_user_id);
         if (summary.is_blocked || summary.is_blocked_by_target) {
             log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "deny", "blocked", "-", "-", "-");
-            return false;
+            return cache_authorization_decision("profile_read_db", actor_user_id, target_user_id, false, "blocked").allowed;
         }
-        const auto profile = ensure_db_profile_exists_and_load(target_user_id, std::nullopt);
+        const auto& profile = ensure_db_profile_exists_and_load(target_user_id, std::nullopt);
         if (required_string(profile, "profileStatus") != "active") {
             log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "deny", "target_inactive", "-", "-", "-");
-            return false;
+            return cache_authorization_decision("profile_read_db", actor_user_id, target_user_id, false, "target_inactive").allowed;
         }
-        const auto settings = ensure_db_privacy_exists_and_load(target_user_id);
+        const auto& settings = ensure_db_privacy_exists_and_load(target_user_id);
         const auto profile_visibility = required_string(settings, "profileVisibility");
         if (profile_visibility == "public") {
             log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "allow", "policy_resolved", "-", "true", profile_visibility);
-            return true;
+            return cache_authorization_decision("profile_read_db", actor_user_id, target_user_id, true, "policy_resolved").allowed;
         }
         if (profile_visibility == "friends_only") {
             const auto allowed = summary.is_friend;
             log_privacy_resolution(actor_user_id, target_user_id, "profile_read", allowed ? "allow" : "deny", allowed ? "policy_resolved" : "profile_visibility_denied", "-", "true", profile_visibility);
-            return allowed;
+            return cache_authorization_decision(
+                "profile_read_db",
+                actor_user_id,
+                target_user_id,
+                allowed,
+                allowed ? "policy_resolved" : "profile_visibility_denied").allowed;
         }
         log_privacy_resolution(actor_user_id, target_user_id, "profile_read", "deny", "profile_visibility_denied", "-", "true", profile_visibility);
-        return false;
+        return cache_authorization_decision("profile_read_db", actor_user_id, target_user_id, false, "profile_visibility_denied").allowed;
     }
 
-    bool allows_friend_request(const std::string& actor_user_id, const std::string& target_user_id, std::string& reason) const {
+    bool allows_friend_request(const std::string& actor_user_id, const std::string& target_user_id, std::string& reason) {
+        if (const auto cached = cached_authorization_decision("friend_request_memory", actor_user_id, target_user_id)) {
+            reason = cached->reason;
+            return cached->allowed;
+        }
         const auto summary = relationship_summary(actor_user_id, target_user_id);
         if (summary.is_blocked || summary.is_blocked_by_target) {
             reason = "blocked";
             log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", reason, bool_string(privacy_.count(actor_user_id) != 0), bool_string(privacy_.count(target_user_id) != 0), "-");
-            return false;
+            return cache_authorization_decision("friend_request_memory", actor_user_id, target_user_id, false, reason).allowed;
         }
         const auto target_privacy_exists = privacy_.count(target_user_id) != 0;
         if (!target_privacy_exists) {
@@ -2236,14 +2385,14 @@ private:
         if (settings.friend_request_policy == "everyone") {
             reason.clear();
             log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "allow", "policy_resolved", bool_string(privacy_.count(actor_user_id) != 0), "true", settings.friend_request_policy, "-");
-            return true;
+            return cache_authorization_decision("friend_request_memory", actor_user_id, target_user_id, true, reason).allowed;
         }
         if (settings.friend_request_policy == "mutuals_only") {
             for (const auto& [key, relation] : relationships_) {
                 if (relation.user_id == actor_user_id && relation.status == "accepted" && is_friend(target_user_id, relation.target_user_id)) {
                     reason.clear();
                     log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "allow", "policy_resolved", bool_string(privacy_.count(actor_user_id) != 0), "true", settings.friend_request_policy, "true");
-                    return true;
+                    return cache_authorization_decision("friend_request_memory", actor_user_id, target_user_id, true, reason).allowed;
                 }
             }
             log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", "friend_request_policy_denied", bool_string(privacy_.count(actor_user_id) != 0), "true", settings.friend_request_policy, "false");
@@ -2252,33 +2401,37 @@ private:
         if (settings.friend_request_policy != "mutuals_only") {
             log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", reason, bool_string(privacy_.count(actor_user_id) != 0), "true", settings.friend_request_policy, "-");
         }
-        return false;
+        return cache_authorization_decision("friend_request_memory", actor_user_id, target_user_id, false, reason).allowed;
     }
 
     bool allows_friend_request_db(const std::string& actor_user_id, const std::string& target_user_id, std::string& reason) {
+        if (const auto cached = cached_authorization_decision("friend_request_db", actor_user_id, target_user_id)) {
+            reason = cached->reason;
+            return cached->allowed;
+        }
         const auto summary = db_relationship_summary(actor_user_id, target_user_id);
         ensure_db_privacy_exists_and_load(actor_user_id);
-        const auto settings = ensure_db_privacy_exists_and_load(target_user_id);
+        const auto& settings = ensure_db_privacy_exists_and_load(target_user_id);
         if (summary.is_blocked || summary.is_blocked_by_target) {
             reason = "blocked";
             log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", reason, "true", "true", "-");
-            return false;
+            return cache_authorization_decision("friend_request_db", actor_user_id, target_user_id, false, reason).allowed;
         }
         const auto policy = required_string(settings, "friendRequestPolicy");
         if (policy == "everyone") {
             reason.clear();
             log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "allow", "policy_resolved", "true", "true", policy, "-");
-            return true;
+            return cache_authorization_decision("friend_request_db", actor_user_id, target_user_id, true, reason).allowed;
         }
         if (policy == "mutuals_only") {
             const bool allowed = db_.has_mutual_friend(actor_user_id, target_user_id);
             reason = allowed ? "" : "friend_request_policy_denied";
             log_privacy_resolution(actor_user_id, target_user_id, "friend_request", allowed ? "allow" : "deny", allowed ? "policy_resolved" : reason, "true", "true", policy, allowed ? "true" : "false");
-            return allowed;
+            return cache_authorization_decision("friend_request_db", actor_user_id, target_user_id, allowed, reason).allowed;
         }
         reason = "friend_request_policy_denied";
         log_privacy_resolution(actor_user_id, target_user_id, "friend_request", "deny", reason, "true", "true", policy, "-");
-        return false;
+        return cache_authorization_decision("friend_request_db", actor_user_id, target_user_id, false, reason).allowed;
     }
 
     void ensure_profile_exists(const std::string& user_id) const {

@@ -20,7 +20,8 @@ User domain service in C++20 with a self-contained HTTP server, deploy assets, m
 ## Auth model used in the MVP
 
 - Public endpoints accept `Authorization: Bearer <jwt>` for smoke/deploy flow and still accept `Authorization: Bearer user:<user-id>` for local/internal development tests
-- Internal endpoints require `X-Internal-Token: internal-secret`
+- Internal endpoints accept `Authorization: Bearer <jwt>` signed with `JWT_SECRET`, with `iss=auth-service` and `aud=internal`
+- `X-Internal-Token: internal-secret` remains a legacy fallback for local compatibility when `Authorization` is absent
 
 ## Build
 
