@@ -1,4 +1,5 @@
 import base64
+import base64
 import hashlib
 import hmac
 import json
@@ -139,6 +140,14 @@ def main() -> int:
         assert patched["displayName"] == "Alice Cooper"
         assert patched["avatarObjectId"] == "obj_avatar_alice"
 
+        alice_privacy = request("PATCH", "/v1/users/me/privacy", {
+            "avatarVisibility": "public",
+        }, user_id=alice)
+        assert alice_privacy["avatarVisibility"] == "public"
+
+        alice_internal_profile = request("GET", f"/internal/users/{alice}/profile", internal=True)
+        assert alice_internal_profile["avatarObjectId"] == "obj_avatar_alice"
+
         privacy = request("PATCH", "/v1/users/me/privacy", {
             "profileVisibility": "friends_only",
             "dmPolicy": "friends_only",
@@ -170,7 +179,7 @@ def main() -> int:
 
         bob_view = request("GET", f"/v1/users/{bob}", user_id=alice)
         assert bob_view["displayName"] == "Bob"
-        assert bob_view["avatarObjectId"] == "obj_avatar_alice" or bob_view["avatarObjectId"] is None
+        assert bob_view["avatarObjectId"] is None
 
         allowed_dm = request("POST", "/internal/users/relationships/check", {
             "actorUserId": alice,
@@ -186,6 +195,13 @@ def main() -> int:
         friends = request("GET", "/v1/users/me/friends?limit=10&offset=0", user_id=alice)
         assert len(friends["items"]) == 1
         assert friends["items"][0]["userId"] == bob
+        reciprocal_friends = request("GET", "/v1/users/me/friends?limit=10&offset=0", user_id=bob)
+        assert len(reciprocal_friends["items"]) == 1
+        assert reciprocal_friends["items"][0]["userId"] == alice
+        cleared_outgoing = request("GET", "/v1/users/me/friend-requests/outgoing?limit=10&offset=0", user_id=alice)
+        assert cleared_outgoing["items"] == []
+        cleared_incoming = request("GET", "/v1/users/me/friend-requests/incoming?limit=10&offset=0", user_id=bob)
+        assert cleared_incoming["items"] == []
 
         declined = request("POST", f"/v1/users/{charlie}/friend-request", user_id=bob, expected_status=201)
         assert declined["status"] == "pending"

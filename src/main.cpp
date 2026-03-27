@@ -500,6 +500,19 @@ std::string pair_key(const std::string& lhs, const std::string& rhs) {
     return lhs + "|" + rhs;
 }
 
+std::optional<std::string> counterpart_relationship_status(const std::string& status) {
+    if (status == "accepted") {
+        return std::string("accepted");
+    }
+    if (status == "pending_outgoing") {
+        return std::string("pending_incoming");
+    }
+    if (status == "pending_incoming") {
+        return std::string("pending_outgoing");
+    }
+    return std::nullopt;
+}
+
 std::optional<std::string> get_env(const char* key) {
 #ifdef _WIN32
     char* value = nullptr;
@@ -990,12 +1003,19 @@ public:
             return {};
         }
         std::ostringstream sql;
+        const auto counterpart_status = counterpart_relationship_status(status);
         sql << "SELECT p.user_id::text, p.display_name, COALESCE(p.username, ''), p.profile_status, "
             << "r.status, "
             << "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
             << "to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') "
-            << "FROM user_relationships r "
-            << "JOIN user_profiles p ON p.user_id=r.target_user_id "
+            << "FROM user_relationships r ";
+        if (counterpart_status.has_value()) {
+            sql << "JOIN user_relationships inverse ON inverse.user_id=r.target_user_id "
+                << "AND inverse.target_user_id=r.user_id "
+                << "AND inverse.relation_type='friend' "
+                << "AND inverse.status='" << shell_escape_single_quotes(*counterpart_status) << "' ";
+        }
+        sql << "JOIN user_profiles p ON p.user_id=r.target_user_id "
             << "WHERE r.user_id='" << shell_escape_single_quotes(user_id) << "' "
             << "AND r.relation_type='friend' "
             << "AND r.status='" << shell_escape_single_quotes(status) << "' "
@@ -1066,59 +1086,87 @@ public:
     }
 
     bool accept_friend_request(const std::string& actor_user_id, const std::string& target_user_id) const {
-        if (get_relationship_status(actor_user_id, target_user_id) != std::optional<std::string>("pending_incoming") ||
-            get_relationship_status(target_user_id, actor_user_id) != std::optional<std::string>("pending_outgoing")) {
-            return false;
-        }
         const auto now = now_iso8601();
         std::ostringstream sql;
-        sql << "BEGIN;";
-        sql << "UPDATE user_relationships SET status='accepted', updated_at=NOW() WHERE relation_type='friend' AND "
-            << "((user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "') OR "
-            << "(user_id='" << shell_escape_single_quotes(target_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "'));";
-        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ("
-            << "'" << shell_escape_single_quotes(hash_to_uuid("friend-request-accepted-" + actor_user_id + "-" + target_user_id + "-" + now)) << "','user_relationship','"
-            << shell_escape_single_quotes(actor_user_id) << "','user.friend_request_accepted','{\"userId\":\""
-            << shell_escape_single_quotes(actor_user_id) << "\",\"targetUserId\":\"" << shell_escape_single_quotes(target_user_id)
-            << "\"}'::jsonb,NOW(),NULL);";
-        sql << "COMMIT;";
-        exec_sql(sql.str());
-        return true;
+        sql << "WITH updated AS ("
+            << "UPDATE user_relationships SET status='accepted', updated_at=NOW() "
+            << "WHERE relation_type='friend' "
+            << "AND EXISTS (SELECT 1 FROM user_relationships incoming "
+            << "WHERE incoming.user_id='" << shell_escape_single_quotes(actor_user_id) << "' "
+            << "AND incoming.target_user_id='" << shell_escape_single_quotes(target_user_id) << "' "
+            << "AND incoming.relation_type='friend' AND incoming.status='pending_incoming') "
+            << "AND EXISTS (SELECT 1 FROM user_relationships outgoing "
+            << "WHERE outgoing.user_id='" << shell_escape_single_quotes(target_user_id) << "' "
+            << "AND outgoing.target_user_id='" << shell_escape_single_quotes(actor_user_id) << "' "
+            << "AND outgoing.relation_type='friend' AND outgoing.status='pending_outgoing') "
+            << "AND ((user_id='" << shell_escape_single_quotes(actor_user_id) << "' "
+            << "AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "' AND status='pending_incoming') "
+            << "OR (user_id='" << shell_escape_single_quotes(target_user_id) << "' "
+            << "AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND status='pending_outgoing')) "
+            << "RETURNING 1"
+            << "), event_insert AS ("
+            << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) "
+            << "SELECT '" << shell_escape_single_quotes(hash_to_uuid("friend-request-accepted-" + actor_user_id + "-" + target_user_id + "-" + now)) << "',"
+            << "'user_relationship','" << shell_escape_single_quotes(actor_user_id) << "','user.friend_request_accepted',"
+            << "'{\"userId\":\"" << shell_escape_single_quotes(actor_user_id) << "\",\"targetUserId\":\"" << shell_escape_single_quotes(target_user_id)
+            << "\"}'::jsonb,NOW(),NULL "
+            << "FROM (SELECT COUNT(*) AS updated_rows FROM updated) counts WHERE counts.updated_rows=2 "
+            << "RETURNING 1"
+            << ") SELECT COUNT(*)::text FROM updated;";
+        return query_scalar(sql.str()) == std::optional<std::string>("2");
     }
 
     bool decline_friend_request(const std::string& actor_user_id, const std::string& target_user_id) const {
-        if (get_relationship_status(actor_user_id, target_user_id) != std::optional<std::string>("pending_incoming") ||
-            get_relationship_status(target_user_id, actor_user_id) != std::optional<std::string>("pending_outgoing")) {
-            return false;
-        }
         std::ostringstream sql;
-        sql << "BEGIN;";
-        sql << "UPDATE user_relationships SET status='declined', updated_at=NOW() WHERE relation_type='friend' AND "
-            << "((user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "') OR "
-            << "(user_id='" << shell_escape_single_quotes(target_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "'));";
-        sql << "COMMIT;";
-        exec_sql(sql.str());
-        return true;
+        sql << "WITH updated AS ("
+            << "UPDATE user_relationships SET status='declined', updated_at=NOW() "
+            << "WHERE relation_type='friend' "
+            << "AND EXISTS (SELECT 1 FROM user_relationships incoming "
+            << "WHERE incoming.user_id='" << shell_escape_single_quotes(actor_user_id) << "' "
+            << "AND incoming.target_user_id='" << shell_escape_single_quotes(target_user_id) << "' "
+            << "AND incoming.relation_type='friend' AND incoming.status='pending_incoming') "
+            << "AND EXISTS (SELECT 1 FROM user_relationships outgoing "
+            << "WHERE outgoing.user_id='" << shell_escape_single_quotes(target_user_id) << "' "
+            << "AND outgoing.target_user_id='" << shell_escape_single_quotes(actor_user_id) << "' "
+            << "AND outgoing.relation_type='friend' AND outgoing.status='pending_outgoing') "
+            << "AND ((user_id='" << shell_escape_single_quotes(actor_user_id) << "' "
+            << "AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "' AND status='pending_incoming') "
+            << "OR (user_id='" << shell_escape_single_quotes(target_user_id) << "' "
+            << "AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND status='pending_outgoing')) "
+            << "RETURNING 1"
+            << ") SELECT COUNT(*)::text FROM updated;";
+        return query_scalar(sql.str()) == std::optional<std::string>("2");
     }
 
     bool remove_friend(const std::string& actor_user_id, const std::string& target_user_id) const {
-        if (!are_friends(actor_user_id, target_user_id)) {
-            return false;
-        }
         const auto now = now_iso8601();
         std::ostringstream sql;
-        sql << "BEGIN;";
-        sql << "UPDATE user_relationships SET status='removed', updated_at=NOW() WHERE relation_type='friend' AND "
-            << "((user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "') OR "
-            << "(user_id='" << shell_escape_single_quotes(target_user_id) << "' AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "'));";
-        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ("
-            << "'" << shell_escape_single_quotes(hash_to_uuid("friend-removed-" + actor_user_id + "-" + target_user_id + "-" + now)) << "','user_relationship','"
-            << shell_escape_single_quotes(actor_user_id) << "','user.friend_removed','{\"userId\":\""
-            << shell_escape_single_quotes(actor_user_id) << "\",\"targetUserId\":\"" << shell_escape_single_quotes(target_user_id)
-            << "\"}'::jsonb,NOW(),NULL);";
-        sql << "COMMIT;";
-        exec_sql(sql.str());
-        return true;
+        sql << "WITH updated AS ("
+            << "UPDATE user_relationships SET status='removed', updated_at=NOW() "
+            << "WHERE relation_type='friend' "
+            << "AND EXISTS (SELECT 1 FROM user_relationships lhs "
+            << "WHERE lhs.user_id='" << shell_escape_single_quotes(actor_user_id) << "' "
+            << "AND lhs.target_user_id='" << shell_escape_single_quotes(target_user_id) << "' "
+            << "AND lhs.relation_type='friend' AND lhs.status='accepted') "
+            << "AND EXISTS (SELECT 1 FROM user_relationships rhs "
+            << "WHERE rhs.user_id='" << shell_escape_single_quotes(target_user_id) << "' "
+            << "AND rhs.target_user_id='" << shell_escape_single_quotes(actor_user_id) << "' "
+            << "AND rhs.relation_type='friend' AND rhs.status='accepted') "
+            << "AND ((user_id='" << shell_escape_single_quotes(actor_user_id) << "' "
+            << "AND target_user_id='" << shell_escape_single_quotes(target_user_id) << "' AND status='accepted') "
+            << "OR (user_id='" << shell_escape_single_quotes(target_user_id) << "' "
+            << "AND target_user_id='" << shell_escape_single_quotes(actor_user_id) << "' AND status='accepted')) "
+            << "RETURNING 1"
+            << "), event_insert AS ("
+            << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) "
+            << "SELECT '" << shell_escape_single_quotes(hash_to_uuid("friend-removed-" + actor_user_id + "-" + target_user_id + "-" + now)) << "',"
+            << "'user_relationship','" << shell_escape_single_quotes(actor_user_id) << "','user.friend_removed',"
+            << "'{\"userId\":\"" << shell_escape_single_quotes(actor_user_id) << "\",\"targetUserId\":\"" << shell_escape_single_quotes(target_user_id)
+            << "\"}'::jsonb,NOW(),NULL "
+            << "FROM (SELECT COUNT(*) AS updated_rows FROM updated) counts WHERE counts.updated_rows=2 "
+            << "RETURNING 1"
+            << ") SELECT COUNT(*)::text FROM updated;";
+        return query_scalar(sql.str()) == std::optional<std::string>("2");
     }
 
     void create_block(const std::string& actor_user_id, const std::string& target_user_id, const std::optional<std::string>& reason) const {
@@ -1474,6 +1522,7 @@ private:
     std::unordered_map<std::string, JsonObject> request_db_privacy_cache_;
     std::unordered_map<std::string, AuthorizationDecision> request_authorization_decision_cache_;
     std::set<std::string> request_privacy_log_cache_;
+    std::set<std::string> request_profile_log_cache_;
 
     void reset_request_context() {
         current_request_id_ = "-";
@@ -1485,6 +1534,7 @@ private:
         request_db_privacy_cache_.clear();
         request_authorization_decision_cache_.clear();
         request_privacy_log_cache_.clear();
+        request_profile_log_cache_.clear();
     }
 
     std::string request_id_for(const Request& request) const {
@@ -1607,7 +1657,7 @@ private:
         for (const auto& [key, value] : extra) {
             oss << ' ' << sanitize_log_value(key) << '=' << sanitize_log_value(value);
         }
-        std::cout << oss.str() << "\n";
+        std::cout << oss.str() << std::endl;
     }
 
     void log_auth_start(const Request& request, const bool auth_header_present, const bool bearer_present) const {
@@ -1690,6 +1740,105 @@ private:
             });
     }
 
+    void log_profile_resolution(
+        const std::string& status,
+        const std::string& actor_user_id,
+        const std::string& target_user_id,
+        const std::string& surface,
+        const std::string& decision,
+        const std::string& reason,
+        const std::string& profile_status,
+        const std::string& profile_visibility,
+        const std::string& avatar_visibility,
+        const std::string& is_friend,
+        const std::string& avatar_object_present,
+        const std::string& avatar_object_exposed) {
+        const std::string cache_key = "resolve|" + status + "|" + actor_user_id + "|" + target_user_id + "|" + surface + "|" + decision + "|" + reason + "|" +
+                                      profile_status + "|" + profile_visibility + "|" + avatar_visibility + "|" + is_friend + "|" +
+                                      avatar_object_present + "|" + avatar_object_exposed;
+        if (!request_profile_log_cache_.insert(cache_key).second) {
+            return;
+        }
+        log_event(
+            "user.profile.resolve",
+            status,
+            actor_user_id,
+            target_user_id,
+            decision,
+            reason,
+            {
+                {"surface", surface},
+                {"profileStatus", profile_status},
+                {"profileVisibility", profile_visibility},
+                {"avatarVisibility", avatar_visibility},
+                {"isFriend", is_friend},
+                {"avatarObjectPresent", avatar_object_present},
+                {"avatarObjectExposed", avatar_object_exposed},
+            });
+    }
+
+    void log_profile_masking_decision(
+        const std::string& actor_user_id,
+        const std::string& target_user_id,
+        const std::string& surface,
+        const std::string& decision,
+        const std::string& reason,
+        const std::string& include_private_fields,
+        const std::string& avatar_visibility,
+        const std::string& is_friend,
+        const std::string& mask_applied) {
+        const std::string cache_key = "mask|" + actor_user_id + "|" + target_user_id + "|" + surface + "|" + decision + "|" + reason + "|" +
+                                      include_private_fields + "|" + avatar_visibility + "|" + is_friend + "|" + mask_applied;
+        if (!request_profile_log_cache_.insert(cache_key).second) {
+            return;
+        }
+        log_event(
+            "user.profile.mask",
+            "-",
+            actor_user_id,
+            target_user_id,
+            decision,
+            reason,
+            {
+                {"surface", surface},
+                {"includePrivateFields", include_private_fields},
+                {"avatarVisibility", avatar_visibility},
+                {"isFriend", is_friend},
+                {"maskApplied", mask_applied},
+            });
+    }
+
+    void log_avatar_visibility_outcome(
+        const std::string& actor_user_id,
+        const std::string& target_user_id,
+        const std::string& surface,
+        const std::string& decision,
+        const std::string& reason,
+        const std::string& avatar_visibility,
+        const std::string& is_friend,
+        const std::string& avatar_object_present,
+        const std::string& avatar_object_exposed) {
+        const std::string cache_key = "avatar|" + actor_user_id + "|" + target_user_id + "|" + surface + "|" + decision + "|" + reason + "|" +
+                                      avatar_visibility + "|" + is_friend + "|" + avatar_object_present + "|" + avatar_object_exposed;
+        if (!request_profile_log_cache_.insert(cache_key).second) {
+            return;
+        }
+        log_event(
+            "user.avatar.visibility",
+            "-",
+            actor_user_id,
+            target_user_id,
+            decision,
+            reason,
+            {
+                {"surface", surface},
+                {"avatarVisibility", avatar_visibility},
+                {"isFriend", is_friend},
+                {"avatarObjectPresent", avatar_object_present},
+                {"avatarObjectExposed", avatar_object_exposed},
+            });
+    }
+
     void log_friend_request_decision(
         const std::string& status,
         const std::string& actor_user_id,
@@ -1755,6 +1904,15 @@ private:
     bool has_pending_incoming(const std::string& actor_user_id, const std::string& target_user_id) const {
         const auto it = relationships_.find(pair_key(actor_user_id, target_user_id));
         return it != relationships_.end() && it->second.status == "pending_incoming";
+    }
+
+    bool has_expected_counterpart_relationship(const std::string& user_id, const std::string& target_user_id, const std::string& status) const {
+        const auto counterpart_status = counterpart_relationship_status(status);
+        if (!counterpart_status.has_value()) {
+            return true;
+        }
+        const auto counterpart_it = relationships_.find(pair_key(target_user_id, user_id));
+        return counterpart_it != relationships_.end() && counterpart_it->second.status == *counterpart_status;
     }
 
     Response route(const Request& request) {
@@ -2110,27 +2268,115 @@ private:
         return summary;
     }
 
-    Json profile_to_json(const UserProfile& profile, bool include_private_fields) const {
-        JsonObject object{
+    JsonObject raw_profile_to_json(const UserProfile& profile) const {
+        return JsonObject{
             {"userId", profile.user_id},
             {"displayName", profile.display_name},
             {"profileStatus", profile.profile_status},
             {"createdAt", profile.created_at},
             {"updatedAt", profile.updated_at},
         };
+    }
+
+    JsonObject profile_to_json(
+        JsonObject object,
+        const std::optional<std::string>& profile_visibility,
+        const std::optional<std::string>& avatar_visibility,
+        const bool include_private_fields,
+        const std::string& actor_user_id,
+        const std::string& surface,
+        const std::string& reason,
+        const bool is_friend) {
+        const std::string target_user_id = required_string(object, "userId");
+        const std::string profile_status = required_string(object, "profileStatus");
+        const std::string resolved_profile_visibility = profile_visibility.value_or("-");
+        const std::string resolved_avatar_visibility = avatar_visibility.value_or("-");
+        const bool avatar_object_present = object.count("avatarObjectId") != 0 && !object.at("avatarObjectId").is_null();
+
+        bool avatar_allowed = include_private_fields;
+        std::string avatar_reason = include_private_fields ? "private_fields_included" : "avatar_available";
+        if (!include_private_fields) {
+            if (resolved_avatar_visibility == "public") {
+                avatar_allowed = true;
+                avatar_reason = "avatar_public";
+            } else if (resolved_avatar_visibility == "friends_only") {
+                avatar_allowed = is_friend;
+                avatar_reason = is_friend ? "avatar_friends_only_friend" : "avatar_friends_only_denied";
+            } else if (resolved_avatar_visibility == "private") {
+                avatar_allowed = false;
+                avatar_reason = "avatar_private";
+            } else {
+                avatar_allowed = true;
+                avatar_reason = "avatar_visibility_unset";
+            }
+        }
+
+        const bool mask_applied = avatar_object_present && !avatar_allowed;
+        if (mask_applied) {
+            object["avatarObjectId"] = Json(nullptr);
+        }
+        const bool avatar_object_exposed = object.count("avatarObjectId") != 0 && !object.at("avatarObjectId").is_null();
+
+        log_profile_resolution(
+            "200",
+            actor_user_id,
+            target_user_id,
+            surface,
+            "allow",
+            reason,
+            profile_status,
+            resolved_profile_visibility,
+            resolved_avatar_visibility,
+            bool_string(is_friend),
+            bool_string(avatar_object_present),
+            bool_string(avatar_object_exposed));
+        log_profile_masking_decision(
+            actor_user_id,
+            target_user_id,
+            surface,
+            mask_applied ? "mask" : "pass",
+            mask_applied ? avatar_reason : (include_private_fields ? "private_fields_included" : "avatar_not_masked"),
+            bool_string(include_private_fields),
+            resolved_avatar_visibility,
+            bool_string(is_friend),
+            bool_string(mask_applied));
+        log_avatar_visibility_outcome(
+            actor_user_id,
+            target_user_id,
+            surface,
+            avatar_object_exposed ? "visible" : "hidden",
+            mask_applied ? avatar_reason : (avatar_object_present ? avatar_reason : "avatar_missing"),
+            resolved_avatar_visibility,
+            bool_string(is_friend),
+            bool_string(avatar_object_present),
+            bool_string(avatar_object_exposed));
+        return object;
+    }
+
+    JsonObject profile_to_json(
+        const UserProfile& profile,
+        const PrivacySettings& privacy,
+        const bool include_private_fields,
+        const std::string& actor_user_id,
+        const std::string& surface,
+        const std::string& reason,
+        const bool is_friend) {
+        auto object = raw_profile_to_json(profile);
         object["username"] = profile.username.has_value() ? Json(*profile.username) : Json(nullptr);
         object["bio"] = profile.bio.has_value() ? Json(*profile.bio) : Json(nullptr);
         object["locale"] = profile.locale.has_value() ? Json(*profile.locale) : Json(nullptr);
         object["timeZone"] = profile.time_zone.has_value() ? Json(*profile.time_zone) : Json(nullptr);
         object["avatarObjectId"] = profile.avatar_object_id.has_value() ? Json(*profile.avatar_object_id) : Json(nullptr);
         object["deletedAt"] = profile.deleted_at.has_value() ? Json(*profile.deleted_at) : Json(nullptr);
-        if (!include_private_fields) {
-            const auto& settings = require_privacy_const(profile.user_id);
-            if (settings.avatar_visibility == "private") {
-                object["avatarObjectId"] = Json(nullptr);
-            }
-        }
-        return object;
+        return profile_to_json(
+            std::move(object),
+            privacy.profile_visibility,
+            privacy.avatar_visibility,
+            include_private_fields,
+            actor_user_id,
+            surface,
+            reason,
+            is_friend);
     }
 
     Json privacy_to_json(const PrivacySettings& privacy) const {
@@ -2609,21 +2855,34 @@ private:
         if (db_.enabled()) {
             const auto profile = db_.get_profile(user_id);
             if (!profile.has_value()) {
+                log_profile_resolution("404", current_actor_for_log(), user_id, "internal_profile", "deny", "not_found", "-", "-", "-", "-", "false", "false");
                 return error_response(404, "not_found", "User profile not found");
             }
+            const auto privacy = db_.get_privacy_settings(user_id);
+            const auto resolved = profile_to_json(
+                *profile,
+                privacy.has_value() ? optional_string(*privacy, "profileVisibility") : std::nullopt,
+                privacy.has_value() ? optional_string(*privacy, "avatarVisibility") : std::nullopt,
+                true,
+                current_actor_for_log(),
+                "internal_profile",
+                "internal_contract",
+                false);
             return json_response(200, JsonObject{
-                {"userId", profile->at("userId")},
-                {"displayName", profile->at("displayName")},
-                {"avatarObjectId", profile->at("avatarObjectId")},
-                {"profileStatus", profile->at("profileStatus")},
+                {"userId", resolved.at("userId")},
+                {"displayName", resolved.at("displayName")},
+                {"avatarObjectId", resolved.at("avatarObjectId")},
+                {"profileStatus", resolved.at("profileStatus")},
             });
         }
         const auto& profile = require_profile_const(user_id);
+        const auto& privacy = require_privacy_const(user_id);
+        const auto resolved = profile_to_json(profile, privacy, true, current_actor_for_log(), "internal_profile", "internal_contract", false);
         return json_response(200, JsonObject{
-            {"userId", profile.user_id},
-            {"displayName", profile.display_name},
-            {"avatarObjectId", profile.avatar_object_id.has_value() ? Json(*profile.avatar_object_id) : Json(nullptr)},
-            {"profileStatus", profile.profile_status},
+            {"userId", resolved.at("userId")},
+            {"displayName", resolved.at("displayName")},
+            {"avatarObjectId", resolved.at("avatarObjectId")},
+            {"profileStatus", resolved.at("profileStatus")},
         });
     }
 
@@ -2732,11 +2991,22 @@ private:
         const auto preferred_display_name = actor_display_name_from_jwt(request);
         if (db_.enabled()) {
             increment_metric("profile.read.self");
-            return json_response(200, ensure_db_profile_exists_and_load(actor_user_id, preferred_display_name));
+            const auto& profile = ensure_db_profile_exists_and_load(actor_user_id, preferred_display_name);
+            const auto& privacy = ensure_db_privacy_exists_and_load(actor_user_id);
+            return json_response(200, profile_to_json(
+                profile,
+                optional_string(privacy, "profileVisibility"),
+                optional_string(privacy, "avatarVisibility"),
+                true,
+                actor_user_id,
+                "self_profile",
+                "self_read",
+                false));
         }
         const auto& profile = ensure_memory_profile_exists(actor_user_id, preferred_display_name);
+        const auto& privacy = require_privacy_const(actor_user_id);
         increment_metric("profile.read.self");
-        return json_response(200, profile_to_json(profile, true));
+        return json_response(200, profile_to_json(profile, privacy, true, actor_user_id, "self_profile", "self_read", false));
     }
 
     Response patch_me(const Request& request) {
@@ -2755,7 +3025,17 @@ private:
             db_.patch_profile(actor_user_id, object);
             increment_metric("profile.updated");
             audit("profile.update", actor_user_id, actor_user_id);
-            return json_response(200, ensure_db_profile_exists_and_load(actor_user_id, preferred_display_name));
+            const auto& profile = ensure_db_profile_exists_and_load(actor_user_id, preferred_display_name);
+            const auto& privacy = ensure_db_privacy_exists_and_load(actor_user_id);
+            return json_response(200, profile_to_json(
+                profile,
+                optional_string(privacy, "profileVisibility"),
+                optional_string(privacy, "avatarVisibility"),
+                true,
+                actor_user_id,
+                "self_profile",
+                "profile_updated",
+                false));
         }
         auto& profile = ensure_memory_profile_exists(actor_user_id, preferred_display_name);
 
@@ -2777,11 +3057,11 @@ private:
 
         publish_event("user.profile_updated", JsonObject{{"userId", actor_user_id}});
         if (object.count("avatarObjectId") != 0) {
-            publish_event("user.avatar_updated", JsonObject{{"userId", actor_user_id}});
+        publish_event("user.avatar_updated", JsonObject{{"userId", actor_user_id}});
         }
         audit("profile.update", actor_user_id, actor_user_id);
         increment_metric("profile.updated");
-        return json_response(200, profile_to_json(profile, true));
+        return json_response(200, profile_to_json(profile, require_privacy_const(actor_user_id), true, actor_user_id, "self_profile", "profile_updated", false));
     }
 
     Response get_user_by_id(const Request& request, const std::string& user_id) {
@@ -2792,15 +3072,35 @@ private:
             if (!authorize_profile_read_db(actor_user_id, user_id)) {
                 return error_response(403, "forbidden", "Profile visibility denied");
             }
+            const auto summary = db_relationship_summary(actor_user_id, user_id);
+            const auto& profile = ensure_db_profile_exists_and_load(user_id, std::nullopt);
+            const auto& privacy = ensure_db_privacy_exists_and_load(user_id);
             increment_metric("profile.read.other");
-            return json_response(200, ensure_db_profile_exists_and_load(user_id, std::nullopt));
+            return json_response(200, profile_to_json(
+                profile,
+                optional_string(privacy, "profileVisibility"),
+                optional_string(privacy, "avatarVisibility"),
+                actor_user_id == user_id,
+                actor_user_id,
+                actor_user_id == user_id ? "self_profile" : "public_profile",
+                "authorized_profile_read",
+                summary.is_friend));
         }
         const auto& profile = require_profile_const(user_id);
+        const auto& privacy = require_privacy_const(user_id);
         if (!authorize_profile_read(actor_user_id, user_id)) {
             return error_response(403, "forbidden", "Profile visibility denied");
         }
+        const auto summary = relationship_summary(actor_user_id, user_id);
         increment_metric("profile.read.other");
-        return json_response(200, profile_to_json(profile, actor_user_id == user_id));
+        return json_response(200, profile_to_json(
+            profile,
+            privacy,
+            actor_user_id == user_id,
+            actor_user_id,
+            actor_user_id == user_id ? "self_profile" : "public_profile",
+            "authorized_profile_read",
+            summary.is_friend));
     }
 
     Response get_my_privacy(const Request& request) {
@@ -3094,6 +3394,9 @@ private:
             int seen = 0;
             for (const auto& [key, relation] : relationships_) {
                 if (relation.user_id != actor_user_id || relation.status != status) {
+                    continue;
+                }
+                if (!has_expected_counterpart_relationship(actor_user_id, relation.target_user_id, relation.status)) {
                     continue;
                 }
                 if (has_block(actor_user_id, relation.target_user_id) || has_block(relation.target_user_id, actor_user_id)) {
