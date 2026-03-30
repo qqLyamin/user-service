@@ -73,6 +73,20 @@ def request(method: str, path: str, body=None, user_id=None, internal=False, int
         return json.loads(raw)
 
 
+def raw_request(method: str, path: str, raw_body=None, headers=None, expected_status=200):
+    req = urllib.request.Request(f"{BASE_URL}{path}", data=raw_body, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode("utf-8")
+            assert resp.status == expected_status, (resp.status, raw)
+            return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8")
+        if exc.code != expected_status:
+            raise AssertionError(f"{method} {path} expected {expected_status}, got {exc.code}: {raw}") from exc
+        return json.loads(raw)
+
+
 def post_event(event_type: str, event_id: str, payload: dict, expected_status=200):
     return request(
         "POST",
@@ -93,6 +107,7 @@ def main() -> int:
     env["JWT_ISSUER"] = INTERNAL_JWT_ISSUER
     env["JWT_AUDIENCE"] = INTERNAL_JWT_AUDIENCE
     env["PRESENCE_GREEN_TTL_SECONDS"] = "1"
+    env["REMINDER_SCAN_INTERVAL_SECONDS"] = "1"
     proc = subprocess.Popen([str(EXE)], cwd=str(ROOT), env=env)
     try:
         wait_for_port("127.0.0.1", 18080)
@@ -130,6 +145,86 @@ def main() -> int:
         me = request("GET", "/v1/users/me", user_id=alice)
         assert me["displayName"] == "Alice"
         assert me["username"] == "alice"
+
+        invalid_json = raw_request(
+            "POST",
+            "/v1/reminders",
+            raw_body=b"{",
+            headers={
+                "Authorization": f"Bearer user:{alice}",
+                "Content-Type": "application/json",
+            },
+            expected_status=400,
+        )
+        assert invalid_json == {"error": "invalid json"}
+
+        initial_remind_at_ms = int(time.time() * 1000) + 1500
+        reminder_payload = {
+            "sourceType": "chat_message",
+            "messageId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "conversationId": "dm:u1:u2",
+            "conversationType": "dm",
+            "roomId": "",
+            "callId": "",
+            "messagePreviewText": "hello",
+            "messageAuthorUserId": bob,
+            "messageAuthorDisplayName": "Bob",
+            "messageTsMs": 1730000000000,
+            "note": "",
+            "remindAtMs": initial_remind_at_ms,
+        }
+        reminder_created = request("POST", "/v1/reminders", reminder_payload, user_id=alice)
+        assert reminder_created["ok"] is True
+        reminder_id = reminder_created["reminder"]["reminderId"]
+
+        duplicate_reminder = request("POST", "/v1/reminders", reminder_payload, user_id=alice)
+        assert duplicate_reminder["reminder"]["reminderId"] == reminder_id
+
+        alice_scheduled = request("GET", "/user/v1/reminders?state=scheduled&limit=10&offset=0", user_id=alice)
+        assert len(alice_scheduled["items"]) == 1
+        assert alice_scheduled["items"][0]["messagePreviewText"] == "hello"
+        assert alice_scheduled["items"][0]["messageAuthorDisplayName"] == "Bob"
+
+        bob_scheduled = request("GET", "/v1/reminders?state=scheduled&limit=10&offset=0", user_id=bob)
+        assert bob_scheduled["items"] == []
+
+        rescheduled_at_ms = int(time.time() * 1000) + 2500
+        rescheduled = request(
+            "PATCH",
+            f"/v1/reminders/{reminder_id}",
+            {"remindAtMs": rescheduled_at_ms, "note": "ping again"},
+            user_id=alice,
+        )
+        assert rescheduled["ok"] is True
+        assert rescheduled["state"] == "scheduled"
+
+        time.sleep(4.0)
+        fired = request("GET", "/v1/reminders?state=fired&limit=10&offset=0", user_id=alice)
+        assert len(fired["items"]) == 1
+        assert fired["items"][0]["reminderId"] == reminder_id
+        assert fired["items"][0]["state"] == "fired"
+        assert fired["items"][0]["note"] == "ping again"
+
+        dismissed = request("PATCH", f"/v1/reminders/{reminder_id}", {"state": "dismissed"}, user_id=alice)
+        assert dismissed["ok"] is True
+        assert dismissed["state"] == "dismissed"
+
+        rescheduled_again_at_ms = int(time.time() * 1000) + 5000
+        rescheduled_again = request(
+            "PATCH",
+            f"/v1/reminders/{reminder_id}",
+            {"state": "scheduled", "remindAtMs": rescheduled_again_at_ms},
+            user_id=alice,
+        )
+        assert rescheduled_again["ok"] is True
+        assert rescheduled_again["state"] == "scheduled"
+
+        deleted_reminder = request("DELETE", f"/v1/reminders/{reminder_id}", user_id=alice)
+        assert deleted_reminder["ok"] is True
+        assert deleted_reminder["reminderId"] == reminder_id
+
+        reminders_after_delete = request("GET", "/v1/reminders?limit=10&offset=0", user_id=alice)
+        assert all(item["reminderId"] != reminder_id for item in reminders_after_delete["items"])
 
         red_presence = request("POST", "/v1/users/presence/query", {"userIds": [alice, bob]}, user_id=alice)
         assert red_presence["items"][0]["presence"] == "red"

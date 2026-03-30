@@ -120,6 +120,11 @@ struct Json {
     JsonObject& as_object() { return std::get<JsonObject>(value); }
 };
 
+class JsonParseError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class JsonParser {
 public:
     explicit JsonParser(const std::string& text) : text_(text) {}
@@ -129,7 +134,7 @@ public:
         Json value = parse_value();
         skip_ws();
         if (pos_ != text_.size()) {
-            throw std::runtime_error("Trailing data after JSON");
+            throw JsonParseError("Trailing data after JSON");
         }
         return value;
     }
@@ -146,7 +151,7 @@ private:
 
     char peek() const {
         if (pos_ >= text_.size()) {
-            throw std::runtime_error("Unexpected end of JSON");
+            throw JsonParseError("Unexpected end of JSON");
         }
         return text_[pos_];
     }
@@ -159,7 +164,7 @@ private:
 
     void expect(const char ch) {
         if (consume() != ch) {
-            throw std::runtime_error("Unexpected JSON token");
+            throw JsonParseError("Unexpected JSON token");
         }
     }
 
@@ -189,12 +194,12 @@ private:
         if (ch == '-' || std::isdigit(static_cast<unsigned char>(ch)) != 0) {
             return Json(parse_number());
         }
-        throw std::runtime_error("Unsupported JSON value");
+        throw JsonParseError("Unsupported JSON value");
     }
 
     void consume_literal(const std::string& literal) {
         if (text_.compare(pos_, literal.size(), literal) != 0) {
-            throw std::runtime_error("Unexpected JSON literal");
+            throw JsonParseError("Unexpected JSON literal");
         }
         pos_ += literal.size();
     }
@@ -220,7 +225,7 @@ private:
                 break;
             }
             if (delimiter != ',') {
-                throw std::runtime_error("Expected object delimiter");
+                throw JsonParseError("Expected object delimiter");
             }
             skip_ws();
         }
@@ -244,7 +249,7 @@ private:
                 break;
             }
             if (delimiter != ',') {
-                throw std::runtime_error("Expected array delimiter");
+                throw JsonParseError("Expected array delimiter");
             }
             skip_ws();
         }
@@ -271,7 +276,7 @@ private:
                     case 'r': result.push_back('\r'); break;
                     case 't': result.push_back('\t'); break;
                     default:
-                        throw std::runtime_error("Unsupported escape sequence");
+                        throw JsonParseError("Unsupported escape sequence");
                 }
                 continue;
             }
@@ -282,7 +287,12 @@ private:
 
     double parse_number() {
         std::size_t consumed = 0;
-        const double value = std::stod(text_.substr(pos_), &consumed);
+        double value = 0.0;
+        try {
+            value = std::stod(text_.substr(pos_), &consumed);
+        } catch (const std::exception&) {
+            throw JsonParseError("Invalid JSON number");
+        }
         pos_ += consumed;
         return value;
     }
@@ -400,12 +410,39 @@ std::vector<std::string> required_string_array(const JsonObject& object, const s
     return values;
 }
 
+std::optional<long long> optional_int64(const JsonObject& object, const std::string& key) {
+    const auto it = object.find(key);
+    if (it == object.end() || it->second.is_null()) {
+        return std::nullopt;
+    }
+    if (!it->second.is_number()) {
+        throw std::runtime_error("Expected integer field: " + key);
+    }
+    return static_cast<long long>(it->second.as_number());
+}
+
+long long required_int64(const JsonObject& object, const std::string& key) {
+    const auto value = optional_int64(object, key);
+    if (!value.has_value()) {
+        throw std::runtime_error("Missing integer field: " + key);
+    }
+    return *value;
+}
+
 int parse_int_query(const std::unordered_map<std::string, std::string>& query, const std::string& key, int fallback) {
     const auto it = query.find(key);
     if (it == query.end()) {
         return fallback;
     }
     return std::max(0, std::stoi(it->second));
+}
+
+long long now_epoch_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+}
+
+Json json_int64(const long long value) {
+    return Json(static_cast<double>(value));
 }
 
 struct Request {
@@ -540,6 +577,28 @@ struct CallHistoryRecord {
     std::optional<std::string> conversation_id;
     std::string created_at;
     std::string updated_at;
+};
+
+struct ReminderRecord {
+    std::string reminder_id;
+    std::string user_id;
+    std::string source_type = "chat_message";
+    std::string message_id;
+    std::string conversation_id;
+    std::string conversation_type;
+    std::string room_id;
+    std::string call_id;
+    std::string message_preview_text;
+    std::string message_author_user_id;
+    std::string message_author_display_name;
+    std::optional<long long> message_ts_ms;
+    std::string note;
+    long long remind_at_ms = 0;
+    std::string state = "scheduled";
+    std::optional<long long> fired_at_ms;
+    std::optional<long long> dismissed_at_ms;
+    long long created_at_ms = 0;
+    long long updated_at_ms = 0;
 };
 
 struct RelationshipSummary {
@@ -981,8 +1040,8 @@ public:
         const auto result = query_scalar(
             "SELECT COUNT(*)::text FROM information_schema.tables "
             "WHERE table_schema='public' AND table_name IN ("
-            "'user_profiles','user_privacy_settings','user_relationships','user_blocks','user_entity_projection','user_call_history','user_presence_sessions','user_event_outbox');");
-        return result.has_value() && *result == "8";
+            "'user_profiles','user_privacy_settings','user_relationships','user_blocks','user_entity_projection','user_call_history','user_presence_sessions','user_reminders','user_event_outbox');");
+        return result.has_value() && *result == "9";
     }
 
     std::optional<JsonObject> get_profile(const std::string& user_id) const {
@@ -1272,6 +1331,193 @@ public:
             << "SELECT COUNT(*)::text FROM deleted;";
         const auto deleted = query_scalar(sql.str());
         return deleted.has_value() ? std::stoi(*deleted) : 0;
+    }
+
+    std::optional<ReminderRecord> create_reminder(const ReminderRecord& record) const {
+        if (!enabled_) {
+            return std::nullopt;
+        }
+        if (const auto existing = find_scheduled_reminder(record.user_id, record.message_id, record.remind_at_ms)) {
+            return existing;
+        }
+        std::ostringstream sql;
+        sql << "INSERT INTO user_reminders ("
+            << "reminder_id, user_id, source_type, message_id, conversation_id, conversation_type, room_id, call_id, "
+            << "message_preview_text, message_author_user_id, message_author_display_name, message_ts_ms, note, "
+            << "remind_at_ms, state, fired_at_ms, dismissed_at_ms, created_at_ms, updated_at_ms"
+            << ") VALUES ("
+            << "'" << shell_escape_single_quotes(record.reminder_id) << "',"
+            << "'" << shell_escape_single_quotes(record.user_id) << "',"
+            << "'" << shell_escape_single_quotes(record.source_type) << "',"
+            << "'" << shell_escape_single_quotes(record.message_id) << "',"
+            << "'" << shell_escape_single_quotes(record.conversation_id) << "',"
+            << "'" << shell_escape_single_quotes(record.conversation_type) << "',"
+            << "'" << shell_escape_single_quotes(record.room_id) << "',"
+            << "'" << shell_escape_single_quotes(record.call_id) << "',"
+            << "'" << shell_escape_single_quotes(record.message_preview_text) << "',"
+            << "'" << shell_escape_single_quotes(record.message_author_user_id) << "',"
+            << "'" << shell_escape_single_quotes(record.message_author_display_name) << "',"
+            << (record.message_ts_ms.has_value() ? std::to_string(*record.message_ts_ms) : "NULL") << ","
+            << "'" << shell_escape_single_quotes(record.note) << "',"
+            << record.remind_at_ms << ","
+            << "'" << shell_escape_single_quotes(record.state) << "',"
+            << (record.fired_at_ms.has_value() ? std::to_string(*record.fired_at_ms) : "NULL") << ","
+            << (record.dismissed_at_ms.has_value() ? std::to_string(*record.dismissed_at_ms) : "NULL") << ","
+            << record.created_at_ms << ","
+            << record.updated_at_ms << ") "
+            << "RETURNING reminder_id::text, user_id, source_type, message_id::text, conversation_id, "
+            << "COALESCE(conversation_type,''), COALESCE(room_id,''), COALESCE(call_id,''), COALESCE(message_preview_text,''), "
+            << "COALESCE(message_author_user_id,''), COALESCE(message_author_display_name,''), COALESCE(message_ts_ms::text,''), "
+            << "COALESCE(note,''), remind_at_ms::text, state, COALESCE(fired_at_ms::text,''), COALESCE(dismissed_at_ms::text,''), "
+            << "created_at_ms::text, updated_at_ms::text;";
+        const auto rows = query_rows(sql.str());
+        if (!rows.has_value() || rows->empty()) {
+            return std::nullopt;
+        }
+        return reminder_from_row(rows->front());
+    }
+
+    std::vector<ReminderRecord> list_reminders(
+        const std::string& user_id,
+        const std::optional<std::string>& state,
+        const int limit,
+        const int offset,
+        const std::optional<long long>& from_ms,
+        const std::optional<long long>& to_ms) const {
+        if (!enabled_) {
+            return {};
+        }
+        std::ostringstream sql;
+        sql << "SELECT reminder_id::text, user_id, source_type, message_id::text, conversation_id, "
+            << "COALESCE(conversation_type,''), COALESCE(room_id,''), COALESCE(call_id,''), COALESCE(message_preview_text,''), "
+            << "COALESCE(message_author_user_id,''), COALESCE(message_author_display_name,''), COALESCE(message_ts_ms::text,''), "
+            << "COALESCE(note,''), remind_at_ms::text, state, COALESCE(fired_at_ms::text,''), COALESCE(dismissed_at_ms::text,''), "
+            << "created_at_ms::text, updated_at_ms::text "
+            << "FROM user_reminders WHERE user_id='" << shell_escape_single_quotes(user_id) << "' ";
+        if (state.has_value()) {
+            sql << "AND state='" << shell_escape_single_quotes(*state) << "' ";
+        }
+        if (from_ms.has_value()) {
+            sql << "AND remind_at_ms >= " << *from_ms << " ";
+        }
+        if (to_ms.has_value()) {
+            sql << "AND remind_at_ms <= " << *to_ms << " ";
+        }
+        if (state == std::optional<std::string>("scheduled")) {
+            sql << "ORDER BY remind_at_ms ASC, updated_at_ms DESC ";
+        } else if (state.has_value()) {
+            sql << "ORDER BY updated_at_ms DESC, remind_at_ms ASC ";
+        } else {
+            sql << "ORDER BY CASE WHEN state='scheduled' THEN 0 ELSE 1 END ASC, "
+                << "CASE WHEN state='scheduled' THEN remind_at_ms ELSE NULL END ASC, "
+                << "CASE WHEN state='scheduled' THEN NULL ELSE updated_at_ms END DESC, created_at_ms DESC ";
+        }
+        sql << "LIMIT " << std::max(limit, 0) << " OFFSET " << std::max(offset, 0) << ";";
+        const auto rows = query_rows(sql.str());
+        if (!rows.has_value()) {
+            return {};
+        }
+        std::vector<ReminderRecord> items;
+        items.reserve(rows->size());
+        for (const auto& row : *rows) {
+            items.push_back(reminder_from_row(row));
+        }
+        return items;
+    }
+
+    std::optional<ReminderRecord> get_reminder(const std::string& user_id, const std::string& reminder_id) const {
+        if (!enabled_) {
+            return std::nullopt;
+        }
+        std::ostringstream sql;
+        sql << "SELECT reminder_id::text, user_id, source_type, message_id::text, conversation_id, "
+            << "COALESCE(conversation_type,''), COALESCE(room_id,''), COALESCE(call_id,''), COALESCE(message_preview_text,''), "
+            << "COALESCE(message_author_user_id,''), COALESCE(message_author_display_name,''), COALESCE(message_ts_ms::text,''), "
+            << "COALESCE(note,''), remind_at_ms::text, state, COALESCE(fired_at_ms::text,''), COALESCE(dismissed_at_ms::text,''), "
+            << "created_at_ms::text, updated_at_ms::text "
+            << "FROM user_reminders WHERE user_id='" << shell_escape_single_quotes(user_id) << "' "
+            << "AND reminder_id='" << shell_escape_single_quotes(reminder_id) << "' LIMIT 1;";
+        const auto rows = query_rows(sql.str());
+        if (!rows.has_value() || rows->empty()) {
+            return std::nullopt;
+        }
+        return reminder_from_row(rows->front());
+    }
+
+    std::optional<ReminderRecord> update_reminder(const ReminderRecord& record) const {
+        if (!enabled_) {
+            return std::nullopt;
+        }
+        std::ostringstream sql;
+        sql << "UPDATE user_reminders SET "
+            << "conversation_type='" << shell_escape_single_quotes(record.conversation_type) << "',"
+            << "room_id='" << shell_escape_single_quotes(record.room_id) << "',"
+            << "call_id='" << shell_escape_single_quotes(record.call_id) << "',"
+            << "message_preview_text='" << shell_escape_single_quotes(record.message_preview_text) << "',"
+            << "message_author_user_id='" << shell_escape_single_quotes(record.message_author_user_id) << "',"
+            << "message_author_display_name='" << shell_escape_single_quotes(record.message_author_display_name) << "',"
+            << "message_ts_ms=" << (record.message_ts_ms.has_value() ? std::to_string(*record.message_ts_ms) : "NULL") << ","
+            << "note='" << shell_escape_single_quotes(record.note) << "',"
+            << "remind_at_ms=" << record.remind_at_ms << ","
+            << "state='" << shell_escape_single_quotes(record.state) << "',"
+            << "fired_at_ms=" << (record.fired_at_ms.has_value() ? std::to_string(*record.fired_at_ms) : "NULL") << ","
+            << "dismissed_at_ms=" << (record.dismissed_at_ms.has_value() ? std::to_string(*record.dismissed_at_ms) : "NULL") << ","
+            << "updated_at_ms=" << record.updated_at_ms << " "
+            << "WHERE user_id='" << shell_escape_single_quotes(record.user_id) << "' "
+            << "AND reminder_id='" << shell_escape_single_quotes(record.reminder_id) << "' "
+            << "RETURNING reminder_id::text, user_id, source_type, message_id::text, conversation_id, "
+            << "COALESCE(conversation_type,''), COALESCE(room_id,''), COALESCE(call_id,''), COALESCE(message_preview_text,''), "
+            << "COALESCE(message_author_user_id,''), COALESCE(message_author_display_name,''), COALESCE(message_ts_ms::text,''), "
+            << "COALESCE(note,''), remind_at_ms::text, state, COALESCE(fired_at_ms::text,''), COALESCE(dismissed_at_ms::text,''), "
+            << "created_at_ms::text, updated_at_ms::text;";
+        const auto rows = query_rows(sql.str());
+        if (!rows.has_value() || rows->empty()) {
+            return std::nullopt;
+        }
+        return reminder_from_row(rows->front());
+    }
+
+    bool delete_reminder(const std::string& user_id, const std::string& reminder_id) const {
+        if (!enabled_) {
+            return false;
+        }
+        std::ostringstream sql;
+        sql << "DELETE FROM user_reminders WHERE user_id='" << shell_escape_single_quotes(user_id) << "' "
+            << "AND reminder_id='" << shell_escape_single_quotes(reminder_id) << "' RETURNING 1;";
+        const auto rows = query_rows(sql.str());
+        return rows.has_value() && !rows->empty();
+    }
+
+    std::vector<ReminderRecord> fire_due_reminders(const long long now_ms, const int limit) const {
+        if (!enabled_) {
+            return {};
+        }
+        std::ostringstream sql;
+        sql << "WITH due AS ("
+            << "SELECT reminder_id FROM user_reminders "
+            << "WHERE state='scheduled' AND remind_at_ms <= " << now_ms << " "
+            << "ORDER BY remind_at_ms ASC LIMIT " << std::max(limit, 1)
+            << ") "
+            << "UPDATE user_reminders SET "
+            << "state='fired', "
+            << "fired_at_ms=COALESCE(fired_at_ms," << now_ms << "), "
+            << "updated_at_ms=" << now_ms << " "
+            << "WHERE reminder_id IN (SELECT reminder_id FROM due) "
+            << "RETURNING reminder_id::text, user_id, source_type, message_id::text, conversation_id, "
+            << "COALESCE(conversation_type,''), COALESCE(room_id,''), COALESCE(call_id,''), COALESCE(message_preview_text,''), "
+            << "COALESCE(message_author_user_id,''), COALESCE(message_author_display_name,''), COALESCE(message_ts_ms::text,''), "
+            << "COALESCE(note,''), remind_at_ms::text, state, COALESCE(fired_at_ms::text,''), COALESCE(dismissed_at_ms::text,''), "
+            << "created_at_ms::text, updated_at_ms::text;";
+        const auto rows = query_rows(sql.str());
+        if (!rows.has_value()) {
+            return {};
+        }
+        std::vector<ReminderRecord> items;
+        items.reserve(rows->size());
+        for (const auto& row : *rows) {
+            items.push_back(reminder_from_row(row));
+        }
+        return items;
     }
 
     bool has_block(const std::string& user_id, const std::string& target_user_id) const {
@@ -1710,6 +1956,53 @@ private:
         }
         return rows;
     }
+
+    std::optional<ReminderRecord> find_scheduled_reminder(
+        const std::string& user_id,
+        const std::string& message_id,
+        const long long remind_at_ms) const {
+        std::ostringstream sql;
+        sql << "SELECT reminder_id::text, user_id, source_type, message_id::text, conversation_id, "
+            << "COALESCE(conversation_type,''), COALESCE(room_id,''), COALESCE(call_id,''), COALESCE(message_preview_text,''), "
+            << "COALESCE(message_author_user_id,''), COALESCE(message_author_display_name,''), COALESCE(message_ts_ms::text,''), "
+            << "COALESCE(note,''), remind_at_ms::text, state, COALESCE(fired_at_ms::text,''), COALESCE(dismissed_at_ms::text,''), "
+            << "created_at_ms::text, updated_at_ms::text "
+            << "FROM user_reminders WHERE user_id='" << shell_escape_single_quotes(user_id) << "' "
+            << "AND message_id='" << shell_escape_single_quotes(message_id) << "' "
+            << "AND remind_at_ms=" << remind_at_ms << " AND state='scheduled' LIMIT 1;";
+        const auto rows = query_rows(sql.str());
+        if (!rows.has_value() || rows->empty()) {
+            return std::nullopt;
+        }
+        return reminder_from_row(rows->front());
+    }
+
+    ReminderRecord reminder_from_row(const std::vector<std::string>& row) const {
+        if (row.size() != 19U) {
+            throw std::runtime_error("Unexpected reminder row shape");
+        }
+        return ReminderRecord{
+            .reminder_id = row[0],
+            .user_id = row[1],
+            .source_type = row[2],
+            .message_id = row[3],
+            .conversation_id = row[4],
+            .conversation_type = row[5],
+            .room_id = row[6],
+            .call_id = row[7],
+            .message_preview_text = row[8],
+            .message_author_user_id = row[9],
+            .message_author_display_name = row[10],
+            .message_ts_ms = row[11].empty() ? std::nullopt : std::optional<long long>(std::stoll(row[11])),
+            .note = row[12],
+            .remind_at_ms = std::stoll(row[13]),
+            .state = row[14],
+            .fired_at_ms = row[15].empty() ? std::nullopt : std::optional<long long>(std::stoll(row[15])),
+            .dismissed_at_ms = row[16].empty() ? std::nullopt : std::optional<long long>(std::stoll(row[16])),
+            .created_at_ms = std::stoll(row[17]),
+            .updated_at_ms = std::stoll(row[18]),
+        };
+    }
 };
 
 std::vector<std::filesystem::path> list_migration_files(const std::string& migrations_dir, const std::string& suffix) {
@@ -1800,6 +2093,10 @@ public:
             auto response = route(request);
             reset_request_context();
             return response;
+        } catch (const JsonParseError&) {
+            auto response = invalid_json_response();
+            reset_request_context();
+            return response;
         } catch (const HttpError& ex) {
             auto response = error_response(ex.status, ex.code, ex.what());
             reset_request_context();
@@ -1809,6 +2106,11 @@ public:
             reset_request_context();
             return response;
         }
+    }
+
+    void run_background_jobs() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        run_background_jobs_locked();
     }
 
 private:
@@ -1822,12 +2124,14 @@ private:
     std::optional<std::string> internal_jwt_secret_ = get_env("INTERNAL_JWT_SECRET");
     std::optional<std::string> internal_token_ = get_env("INTERNAL_TOKEN");
     int presence_green_ttl_seconds_ = parse_int_env("PRESENCE_GREEN_TTL_SECONDS", 30);
+    int reminder_scan_interval_seconds_ = parse_int_env("REMINDER_SCAN_INTERVAL_SECONDS", 15);
     std::unordered_map<std::string, UserProfile> profiles_;
     std::unordered_map<std::string, PrivacySettings> privacy_;
     std::unordered_map<std::string, RelationshipRecord> relationships_;
     std::unordered_map<std::string, BlockRecord> blocks_;
     std::unordered_map<std::string, ProjectionRecord> projections_;
     std::unordered_map<std::string, CallHistoryRecord> call_history_;
+    std::unordered_map<std::string, ReminderRecord> reminders_;
     std::unordered_map<std::string, PresenceSessionRecord> presence_sessions_;
     std::unordered_map<std::string, DeviceSession> sessions_;
     std::vector<JsonObject> outbox_;
@@ -1844,6 +2148,7 @@ private:
     std::unordered_map<std::string, AuthorizationDecision> request_authorization_decision_cache_;
     std::set<std::string> request_privacy_log_cache_;
     std::set<std::string> request_profile_log_cache_;
+    long long next_reminder_scan_at_ms_ = 0;
 
     void reset_request_context() {
         current_request_id_ = "-";
@@ -2237,6 +2542,7 @@ private:
     }
 
     Response route(const Request& request) {
+        run_background_jobs_locked();
         if (request.method == "GET" && request.path == "/healthz") {
             return json_response(200, JsonObject{{"status", "ok"}});
         }
@@ -2288,6 +2594,18 @@ private:
         if (request.method == "PATCH" && request.path == "/v1/users/me/privacy") {
             return patch_my_privacy(request);
         }
+        if (request.method == "POST" && is_reminder_collection_path(request.path)) {
+            return create_my_reminder(request);
+        }
+        if (request.method == "GET" && is_reminder_collection_path(request.path)) {
+            return list_my_reminders(request);
+        }
+        if (request.method == "PATCH" && is_reminder_item_path(request.path)) {
+            return patch_my_reminder(request);
+        }
+        if (request.method == "DELETE" && is_reminder_item_path(request.path)) {
+            return delete_my_reminder(request);
+        }
         if (request.method == "POST" && request.path == "/v1/users/me/presence/pulse") {
             return pulse_my_presence(request);
         }
@@ -2338,6 +2656,14 @@ private:
         return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
     }
 
+    static bool is_reminder_collection_path(const std::string& path) {
+        return path == "/v1/reminders" || path == "/user/v1/reminders";
+    }
+
+    static bool is_reminder_item_path(const std::string& path) {
+        return starts_with(path, "/v1/reminders/") || starts_with(path, "/user/v1/reminders/");
+    }
+
     Response handle_user_scoped_route(const Request& request) {
         const auto segments = split_path(request.path);
         const auto target_user_id = segments.size() >= 3 ? canonical_user_id(segments[2]) : std::string{};
@@ -2382,6 +2708,11 @@ private:
         response.status = status;
         response.body = std::move(body);
         return response;
+    }
+
+    Response invalid_json_response() {
+        increment_metric("http.error.400");
+        return json_response(400, JsonObject{{"error", "invalid json"}});
     }
 
     Response error_response(int status, const std::string& code, const std::string& message) {
@@ -2783,6 +3114,145 @@ private:
         };
     }
 
+    Json reminder_to_json(const ReminderRecord& record) const {
+        return JsonObject{
+            {"reminderId", record.reminder_id},
+            {"sourceType", record.source_type},
+            {"messageId", record.message_id},
+            {"conversationId", record.conversation_id},
+            {"conversationType", record.conversation_type},
+            {"roomId", record.room_id},
+            {"callId", record.call_id},
+            {"messagePreviewText", record.message_preview_text},
+            {"messageAuthorUserId", record.message_author_user_id},
+            {"messageAuthorDisplayName", record.message_author_display_name},
+            {"messageTsMs", record.message_ts_ms.has_value() ? json_int64(*record.message_ts_ms) : Json(nullptr)},
+            {"note", record.note},
+            {"remindAtMs", json_int64(record.remind_at_ms)},
+            {"state", record.state},
+            {"firedAtMs", record.fired_at_ms.has_value() ? json_int64(*record.fired_at_ms) : Json(nullptr)},
+            {"dismissedAtMs", record.dismissed_at_ms.has_value() ? json_int64(*record.dismissed_at_ms) : Json(nullptr)},
+            {"createdAtMs", json_int64(record.created_at_ms)},
+            {"updatedAtMs", json_int64(record.updated_at_ms)},
+        };
+    }
+
+    Response reminder_error_response(const int status, const std::string& error) {
+        increment_metric("http.error." + std::to_string(status));
+        return json_response(status, JsonObject{{"ok", false}, {"error", error}});
+    }
+
+    std::optional<long long> parse_optional_long_long_query(const Request& request, const std::string& key) const {
+        const auto it = request.query.find(key);
+        if (it == request.query.end() || trim(it->second).empty()) {
+            return std::nullopt;
+        }
+        return std::stoll(it->second);
+    }
+
+    std::string extract_reminder_id_from_path(const std::string& path) const {
+        const std::vector<std::string> prefixes = {"/v1/reminders/", "/user/v1/reminders/"};
+        for (const auto& prefix : prefixes) {
+            if (!starts_with(path, prefix)) {
+                continue;
+            }
+            const std::string reminder_id = path.substr(prefix.size());
+            if (!reminder_id.empty() && reminder_id.find('/') == std::string::npos) {
+                return reminder_id;
+            }
+        }
+        throw HttpError(404, "not_found", "Route not found");
+    }
+
+    void validate_reminder_state(const std::string& value) const {
+        static const std::set<std::string> allowed = {"scheduled", "fired", "dismissed", "cancelled"};
+        if (!allowed.count(value)) {
+            throw std::runtime_error("Invalid reminder state");
+        }
+    }
+
+    ReminderRecord build_reminder_from_create_request(
+        const JsonObject& object,
+        const std::string& actor_user_id,
+        const long long now_ms) const {
+        const auto source_type = optional_string(object, "sourceType");
+        if (!source_type.has_value()) {
+            throw HttpError(400, "sourceType is required", "sourceType is required");
+        }
+        if (*source_type != "chat_message") {
+            throw HttpError(400, "unsupported sourceType", "unsupported sourceType");
+        }
+        const auto message_id = optional_string(object, "messageId");
+        if (!message_id.has_value() || message_id->empty()) {
+            throw HttpError(400, "messageId is required", "messageId is required");
+        }
+        if (!is_uuid_like(*message_id)) {
+            throw HttpError(400, "messageId must be uuid", "messageId must be uuid");
+        }
+        const auto conversation_id = optional_string(object, "conversationId");
+        if (!conversation_id.has_value() || conversation_id->empty()) {
+            throw HttpError(400, "conversationId is required", "conversationId is required");
+        }
+        const auto remind_at_ms = optional_int64(object, "remindAtMs");
+        if (!remind_at_ms.has_value()) {
+            throw HttpError(400, "remindAtMs is required", "remindAtMs is required");
+        }
+        if (*remind_at_ms <= now_ms - 5000) {
+            throw HttpError(400, "remindAtMs must be in the future", "remindAtMs must be in the future");
+        }
+        const std::string message_preview_text = optional_string(object, "messagePreviewText").value_or("");
+        if (message_preview_text.size() > 512U) {
+            throw HttpError(400, "messagePreviewText too long", "messagePreviewText too long");
+        }
+        const std::string note = optional_string(object, "note").value_or("");
+        if (note.size() > 1000U) {
+            throw HttpError(400, "note too long", "note too long");
+        }
+        return ReminderRecord{
+            .reminder_id = hash_to_uuid("reminder-" + actor_user_id + "-" + *message_id + "-" + std::to_string(*remind_at_ms) + "-" + std::to_string(now_ms)),
+            .user_id = actor_user_id,
+            .source_type = *source_type,
+            .message_id = *message_id,
+            .conversation_id = *conversation_id,
+            .conversation_type = optional_string(object, "conversationType").value_or(""),
+            .room_id = optional_string(object, "roomId").value_or(""),
+            .call_id = optional_string(object, "callId").value_or(""),
+            .message_preview_text = message_preview_text,
+            .message_author_user_id = optional_string(object, "messageAuthorUserId").value_or(""),
+            .message_author_display_name = optional_string(object, "messageAuthorDisplayName").value_or(""),
+            .message_ts_ms = optional_int64(object, "messageTsMs"),
+            .note = note,
+            .remind_at_ms = *remind_at_ms,
+            .state = "scheduled",
+            .fired_at_ms = std::nullopt,
+            .dismissed_at_ms = std::nullopt,
+            .created_at_ms = now_ms,
+            .updated_at_ms = now_ms,
+        };
+    }
+
+    bool can_transition_reminder_state(
+        const std::string& current_state,
+        const std::string& next_state,
+        const bool remind_at_ms_present) const {
+        if (next_state == "fired") {
+            return false;
+        }
+        if (current_state == next_state) {
+            return current_state != "cancelled";
+        }
+        if (current_state == "scheduled" && (next_state == "dismissed" || next_state == "cancelled")) {
+            return true;
+        }
+        if (current_state == "dismissed" && next_state == "scheduled" && remind_at_ms_present) {
+            return true;
+        }
+        if (current_state == "fired" && next_state == "dismissed") {
+            return true;
+        }
+        return false;
+    }
+
     std::vector<std::string> normalize_participant_user_ids(
         const std::vector<std::string>& participant_user_ids,
         const std::string& initiator_user_id) const {
@@ -2884,6 +3354,137 @@ private:
             }
         }
         return deleted;
+    }
+
+    ReminderRecord create_memory_reminder(const ReminderRecord& record) {
+        for (const auto& [key, existing] : reminders_) {
+            if (existing.user_id == record.user_id &&
+                existing.message_id == record.message_id &&
+                existing.remind_at_ms == record.remind_at_ms &&
+                existing.state == "scheduled") {
+                return existing;
+            }
+        }
+        reminders_[record.reminder_id] = record;
+        return reminders_.at(record.reminder_id);
+    }
+
+    std::optional<ReminderRecord> get_memory_reminder(const std::string& user_id, const std::string& reminder_id) const {
+        const auto it = reminders_.find(reminder_id);
+        if (it == reminders_.end() || it->second.user_id != user_id) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+    std::vector<ReminderRecord> list_memory_reminders(
+        const std::string& user_id,
+        const std::optional<std::string>& state,
+        const int limit,
+        const int offset,
+        const std::optional<long long>& from_ms,
+        const std::optional<long long>& to_ms) const {
+        std::vector<ReminderRecord> items;
+        for (const auto& [key, record] : reminders_) {
+            if (record.user_id != user_id) {
+                continue;
+            }
+            if (state.has_value() && record.state != *state) {
+                continue;
+            }
+            if (from_ms.has_value() && record.remind_at_ms < *from_ms) {
+                continue;
+            }
+            if (to_ms.has_value() && record.remind_at_ms > *to_ms) {
+                continue;
+            }
+            items.push_back(record);
+        }
+        std::sort(items.begin(), items.end(), [state](const ReminderRecord& lhs, const ReminderRecord& rhs) {
+            if (state == std::optional<std::string>("scheduled")) {
+                if (lhs.remind_at_ms == rhs.remind_at_ms) {
+                    return lhs.updated_at_ms > rhs.updated_at_ms;
+                }
+                return lhs.remind_at_ms < rhs.remind_at_ms;
+            }
+            if (state.has_value()) {
+                if (lhs.updated_at_ms == rhs.updated_at_ms) {
+                    return lhs.remind_at_ms < rhs.remind_at_ms;
+                }
+                return lhs.updated_at_ms > rhs.updated_at_ms;
+            }
+            if (lhs.state == "scheduled" && rhs.state != "scheduled") {
+                return true;
+            }
+            if (lhs.state != "scheduled" && rhs.state == "scheduled") {
+                return false;
+            }
+            if (lhs.state == "scheduled" && rhs.state == "scheduled") {
+                if (lhs.remind_at_ms == rhs.remind_at_ms) {
+                    return lhs.updated_at_ms > rhs.updated_at_ms;
+                }
+                return lhs.remind_at_ms < rhs.remind_at_ms;
+            }
+            if (lhs.updated_at_ms == rhs.updated_at_ms) {
+                return lhs.remind_at_ms < rhs.remind_at_ms;
+            }
+            return lhs.updated_at_ms > rhs.updated_at_ms;
+        });
+        const int safe_offset = std::max(offset, 0);
+        const int safe_limit = std::max(limit, 0);
+        if (safe_offset >= static_cast<int>(items.size())) {
+            return {};
+        }
+        const auto begin = items.begin() + safe_offset;
+        const auto end = begin + std::min(safe_limit, static_cast<int>(items.end() - begin));
+        return std::vector<ReminderRecord>(begin, end);
+    }
+
+    std::optional<ReminderRecord> update_memory_reminder(const ReminderRecord& record) {
+        const auto it = reminders_.find(record.reminder_id);
+        if (it == reminders_.end() || it->second.user_id != record.user_id) {
+            return std::nullopt;
+        }
+        it->second = record;
+        return it->second;
+    }
+
+    bool delete_memory_reminder(const std::string& user_id, const std::string& reminder_id) {
+        const auto it = reminders_.find(reminder_id);
+        if (it == reminders_.end() || it->second.user_id != user_id) {
+            return false;
+        }
+        reminders_.erase(it);
+        return true;
+    }
+
+    std::vector<ReminderRecord> fire_due_memory_reminders(const long long now_ms, const int limit) {
+        std::vector<ReminderRecord> due_items;
+        for (const auto& [key, record] : reminders_) {
+            if (record.state == "scheduled" && record.remind_at_ms <= now_ms) {
+                due_items.push_back(record);
+            }
+        }
+        std::sort(due_items.begin(), due_items.end(), [](const ReminderRecord& lhs, const ReminderRecord& rhs) {
+            if (lhs.remind_at_ms == rhs.remind_at_ms) {
+                return lhs.created_at_ms < rhs.created_at_ms;
+            }
+            return lhs.remind_at_ms < rhs.remind_at_ms;
+        });
+        if (static_cast<int>(due_items.size()) > limit) {
+            due_items.resize(limit);
+        }
+        std::vector<ReminderRecord> fired_items;
+        fired_items.reserve(due_items.size());
+        for (auto& item : due_items) {
+            auto stored = reminders_.at(item.reminder_id);
+            stored.state = "fired";
+            stored.fired_at_ms = now_ms;
+            stored.updated_at_ms = now_ms;
+            reminders_[stored.reminder_id] = stored;
+            fired_items.push_back(stored);
+        }
+        return fired_items;
     }
 
     void upsert_memory_presence_session(
@@ -4162,6 +4763,185 @@ private:
         return json_response(200, JsonObject{{"status", "cleared"}, {"deletedCount", deleted_count}});
     }
 
+    Response create_my_reminder(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        ReminderRecord reminder;
+        try {
+            const auto body = JsonParser(request.body).parse();
+            const auto& object = require_object(body);
+            reminder = build_reminder_from_create_request(object, actor_user_id, now_epoch_ms());
+        } catch (const HttpError& ex) {
+            return reminder_error_response(ex.status, ex.code);
+        } catch (const JsonParseError&) {
+            return invalid_json_response();
+        } catch (const std::runtime_error& ex) {
+            return reminder_error_response(400, ex.what());
+        }
+        try {
+            const auto stored = db_.enabled()
+                ? db_.create_reminder(reminder)
+                : std::optional<ReminderRecord>(create_memory_reminder(reminder));
+            if (!stored.has_value()) {
+                return reminder_error_response(500, "db");
+            }
+            audit("reminder.create", actor_user_id, actor_user_id, JsonObject{{"reminderId", stored->reminder_id}});
+            increment_metric("reminder.created");
+            return json_response(200, JsonObject{
+                {"ok", true},
+                {"reminder", JsonObject{
+                    {"reminderId", stored->reminder_id},
+                    {"state", stored->state},
+                    {"remindAtMs", json_int64(stored->remind_at_ms)},
+                }},
+            });
+        } catch (const std::exception&) {
+            return reminder_error_response(500, "db");
+        }
+    }
+
+    Response list_my_reminders(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        std::optional<std::string> state;
+        int limit = 50;
+        int offset = 0;
+        std::optional<long long> from_ms;
+        std::optional<long long> to_ms;
+        try {
+            state = request.query.count("state") != 0 && !trim(request.query.at("state")).empty()
+                ? std::optional<std::string>(trim(request.query.at("state")))
+                : std::nullopt;
+            if (state.has_value()) {
+                validate_reminder_state(*state);
+            }
+            limit = parse_int_query(request.query, "limit", 50);
+            offset = parse_int_query(request.query, "offset", 0);
+            from_ms = parse_optional_long_long_query(request, "fromMs");
+            to_ms = parse_optional_long_long_query(request, "toMs");
+        } catch (const std::runtime_error& ex) {
+            return reminder_error_response(400, ex.what());
+        }
+        JsonArray items;
+        try {
+            const auto reminders = db_.enabled()
+                ? db_.list_reminders(actor_user_id, state, limit, offset, from_ms, to_ms)
+                : list_memory_reminders(actor_user_id, state, limit, offset, from_ms, to_ms);
+            for (const auto& reminder : reminders) {
+                items.emplace_back(reminder_to_json(reminder));
+            }
+        } catch (const std::exception&) {
+            return reminder_error_response(500, "db");
+        }
+        increment_metric("reminder.list");
+        return json_response(200, JsonObject{{"items", items}});
+    }
+
+    Response patch_my_reminder(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const std::string reminder_id = extract_reminder_id_from_path(request.path);
+        std::optional<ReminderRecord> existing;
+        try {
+            existing = db_.enabled()
+                ? db_.get_reminder(actor_user_id, reminder_id)
+                : get_memory_reminder(actor_user_id, reminder_id);
+        } catch (const std::exception&) {
+            return reminder_error_response(500, "db");
+        }
+        if (!existing.has_value()) {
+            return reminder_error_response(404, "reminder_not_found");
+        }
+        ReminderRecord updated = *existing;
+        try {
+            const auto body = JsonParser(request.body).parse();
+            const auto& object = require_object(body);
+            const auto state = optional_string(object, "state");
+            const auto remind_at_ms = optional_int64(object, "remindAtMs");
+            const auto note = optional_string(object, "note");
+            const auto now_ms = now_epoch_ms();
+
+            if (note.has_value()) {
+                if (note->size() > 1000U) {
+                    return reminder_error_response(400, "note too long");
+                }
+                updated.note = *note;
+            }
+
+            const std::string next_state = state.value_or(existing->state);
+            validate_reminder_state(next_state);
+            if (!can_transition_reminder_state(existing->state, next_state, remind_at_ms.has_value())) {
+                return reminder_error_response(400, "invalid_state_transition");
+            }
+            if (remind_at_ms.has_value() && next_state != "scheduled") {
+                return reminder_error_response(400, "invalid_state_transition");
+            }
+            if (remind_at_ms.has_value()) {
+                if (*remind_at_ms <= now_ms - 5000) {
+                    return reminder_error_response(400, "remindAtMs must be in the future");
+                }
+                updated.remind_at_ms = *remind_at_ms;
+            }
+
+            updated.state = next_state;
+            updated.updated_at_ms = now_ms;
+            if (next_state == "dismissed") {
+                updated.dismissed_at_ms = now_ms;
+            }
+            if (next_state == "scheduled") {
+                if (!remind_at_ms.has_value() && existing->state != "scheduled") {
+                    return reminder_error_response(400, "invalid_state_transition");
+                }
+                updated.fired_at_ms = existing->fired_at_ms;
+                updated.dismissed_at_ms = std::nullopt;
+            }
+            if (next_state == "cancelled") {
+                updated.dismissed_at_ms = existing->dismissed_at_ms;
+            }
+        } catch (const JsonParseError&) {
+            return invalid_json_response();
+        } catch (const std::runtime_error& ex) {
+            return reminder_error_response(400, ex.what());
+        }
+        try {
+            auto persisted = db_.enabled()
+                ? db_.update_reminder(updated)
+                : update_memory_reminder(updated);
+            if (!persisted.has_value()) {
+                return reminder_error_response(404, "reminder_not_found");
+            }
+            audit("reminder.update", actor_user_id, actor_user_id, JsonObject{{"reminderId", persisted->reminder_id}, {"state", persisted->state}});
+            increment_metric("reminder.updated");
+            return json_response(200, JsonObject{
+                {"ok", true},
+                {"reminderId", persisted->reminder_id},
+                {"state", persisted->state},
+                {"updatedAtMs", json_int64(persisted->updated_at_ms)},
+            });
+        } catch (const std::exception&) {
+            return reminder_error_response(500, "db");
+        }
+    }
+
+    Response delete_my_reminder(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const std::string reminder_id = extract_reminder_id_from_path(request.path);
+        try {
+            const bool deleted = db_.enabled()
+                ? db_.delete_reminder(actor_user_id, reminder_id)
+                : delete_memory_reminder(actor_user_id, reminder_id);
+            if (!deleted) {
+                return reminder_error_response(404, "reminder_not_found");
+            }
+            audit("reminder.delete", actor_user_id, actor_user_id, JsonObject{{"reminderId", reminder_id}});
+            increment_metric("reminder.deleted");
+            return json_response(200, JsonObject{{"ok", true}, {"reminderId", reminder_id}});
+        } catch (const std::exception&) {
+            return reminder_error_response(500, "db");
+        }
+    }
+
     Response list_relationship_collection(const Request& request, const std::string& status, const std::string& metric_name) {
         const auto actor_user_id = require_actor_user_id(request);
         ensure_profile_exists(actor_user_id);
@@ -4213,6 +4993,40 @@ private:
         }
         increment_metric(metric_name);
         return json_response(200, JsonObject{{"items", items}, {"limit", limit}, {"offset", offset}});
+    }
+
+    void run_background_jobs_locked() {
+        const auto now_ms = now_epoch_ms();
+        if (now_ms < next_reminder_scan_at_ms_) {
+            return;
+        }
+        next_reminder_scan_at_ms_ = now_ms + (std::max(reminder_scan_interval_seconds_, 1) * 1000LL);
+        std::vector<ReminderRecord> fired;
+        try {
+            fired = db_.enabled()
+                ? db_.fire_due_reminders(now_ms, 200)
+                : fire_due_memory_reminders(now_ms, 200);
+        } catch (const std::exception&) {
+            return;
+        }
+        for (const auto& reminder : fired) {
+            increment_metric("reminder.fired");
+            if (!db_.enabled()) {
+                publish_event("reminder_fired", JsonObject{
+                    {"type", "reminder_fired"},
+                    {"reminder", JsonObject{
+                        {"reminderId", reminder.reminder_id},
+                        {"sourceType", reminder.source_type},
+                        {"messageId", reminder.message_id},
+                        {"conversationId", reminder.conversation_id},
+                        {"messagePreviewText", reminder.message_preview_text},
+                        {"messageAuthorDisplayName", reminder.message_author_display_name},
+                        {"remindAtMs", json_int64(reminder.remind_at_ms)},
+                        {"firedAtMs", reminder.fired_at_ms.has_value() ? json_int64(*reminder.fired_at_ms) : Json(nullptr)},
+                    }},
+                });
+            }
+        }
     }
 };
 
@@ -4275,9 +5089,11 @@ std::string status_text(int status) {
         case 200: return "OK";
         case 201: return "Created";
         case 400: return "Bad Request";
+        case 401: return "Unauthorized";
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 409: return "Conflict";
+        case 500: return "Internal Server Error";
         case 503: return "Service Unavailable";
         default: return "OK";
     }
@@ -4396,6 +5212,29 @@ int run_server(unsigned short port) {
     ServiceState state;
 
     while (true) {
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET(server_socket, &read_set);
+        timeval timeout{};
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        const int select_result = select(
+#ifdef _WIN32
+            0,
+#else
+            server_socket + 1,
+#endif
+            &read_set,
+            nullptr,
+            nullptr,
+            &timeout);
+        if (select_result == 0) {
+            state.run_background_jobs();
+            continue;
+        }
+        if (select_result == SOCKET_ERROR) {
+            continue;
+        }
         SOCKET client_socket = accept(server_socket, nullptr, nullptr);
         if (client_socket == INVALID_SOCKET) {
             continue;
