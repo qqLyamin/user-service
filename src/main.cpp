@@ -385,6 +385,21 @@ std::string required_string(const JsonObject& object, const std::string& key) {
     return *value;
 }
 
+std::vector<std::string> required_string_array(const JsonObject& object, const std::string& key) {
+    const auto it = object.find(key);
+    if (it == object.end() || !it->second.is_array()) {
+        throw std::runtime_error("Expected string array field: " + key);
+    }
+    std::vector<std::string> values;
+    for (const auto& entry : it->second.as_array()) {
+        if (!entry.is_string()) {
+            throw std::runtime_error("Expected string array field: " + key);
+        }
+        values.push_back(entry.as_string());
+    }
+    return values;
+}
+
 int parse_int_query(const std::unordered_map<std::string, std::string>& query, const std::string& key, int fallback) {
     const auto it = query.find(key);
     if (it == query.end()) {
@@ -485,6 +500,25 @@ struct DeviceSession {
     std::string updated_at;
 };
 
+struct CallHistoryRecord {
+    std::string history_id;
+    std::string call_id;
+    std::string owner_user_id;
+    std::string initiator_user_id;
+    std::string call_type;
+    std::string direction;
+    std::string status;
+    std::vector<std::string> participant_user_ids;
+    int participant_count = 0;
+    std::string started_at;
+    std::optional<std::string> ended_at;
+    int duration_seconds = 0;
+    std::optional<std::string> room_id;
+    std::optional<std::string> conversation_id;
+    std::string created_at;
+    std::string updated_at;
+};
+
 struct RelationshipSummary {
     bool is_friend = false;
     bool is_blocked = false;
@@ -498,6 +532,29 @@ struct AuthorizationDecision {
 
 std::string pair_key(const std::string& lhs, const std::string& rhs) {
     return lhs + "|" + rhs;
+}
+
+std::string join_strings(const std::vector<std::string>& values, const std::string& delimiter) {
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i != 0U) {
+            oss << delimiter;
+        }
+        oss << values[i];
+    }
+    return oss.str();
+}
+
+std::vector<std::string> split_string(const std::string& value, const char delimiter) {
+    std::vector<std::string> parts;
+    std::stringstream ss(value);
+    std::string item;
+    while (std::getline(ss, item, delimiter)) {
+        if (!item.empty()) {
+            parts.push_back(item);
+        }
+    }
+    return parts;
 }
 
 std::optional<std::string> counterpart_relationship_status(const std::string& status) {
@@ -889,8 +946,8 @@ public:
         const auto result = query_scalar(
             "SELECT COUNT(*)::text FROM information_schema.tables "
             "WHERE table_schema='public' AND table_name IN ("
-            "'user_profiles','user_privacy_settings','user_relationships','user_blocks','user_entity_projection','user_event_outbox');");
-        return result.has_value() && *result == "6";
+            "'user_profiles','user_privacy_settings','user_relationships','user_blocks','user_entity_projection','user_call_history','user_event_outbox');");
+        return result.has_value() && *result == "7";
     }
 
     std::optional<JsonObject> get_profile(const std::string& user_id) const {
@@ -954,6 +1011,149 @@ public:
             {"createdAt", columns[6]},
             {"updatedAt", columns[7]},
         };
+    }
+
+    void upsert_call_history(
+        const std::string& call_id,
+        const std::string& initiator_user_id,
+        const std::vector<std::string>& participant_user_ids,
+        const std::string& call_type,
+        const std::string& status,
+        const std::string& started_at,
+        const std::optional<std::string>& ended_at,
+        const int duration_seconds,
+        const std::optional<std::string>& room_id,
+        const std::optional<std::string>& conversation_id) const {
+        if (!enabled_) {
+            return;
+        }
+
+        const auto now = now_iso8601();
+        const std::string escaped_call_id = shell_escape_single_quotes(call_id);
+        const std::string escaped_initiator_user_id = shell_escape_single_quotes(initiator_user_id);
+        const std::string escaped_call_type = shell_escape_single_quotes(call_type);
+        const std::string escaped_status = shell_escape_single_quotes(status);
+        const std::string escaped_started_at = shell_escape_single_quotes(started_at);
+        const std::string ended_at_sql = ended_at.has_value() ? "'" + shell_escape_single_quotes(*ended_at) + "'::timestamptz" : "NULL";
+        const std::string room_id_sql = room_id.has_value() ? "'" + shell_escape_single_quotes(*room_id) + "'" : "NULL";
+        const std::string conversation_id_sql = conversation_id.has_value() ? "'" + shell_escape_single_quotes(*conversation_id) + "'" : "NULL";
+        const std::string participants_csv = join_strings(participant_user_ids, ",");
+        const std::string escaped_participants_csv = shell_escape_single_quotes(participants_csv);
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        for (const auto& participant_user_id : participant_user_ids) {
+            const std::string canonical_participant_user_id = canonical_user_id(participant_user_id);
+            const std::string escaped_owner_user_id = shell_escape_single_quotes(canonical_participant_user_id);
+            const std::string direction = canonical_participant_user_id == initiator_user_id ? "outgoing" : "incoming";
+            sql << "INSERT INTO user_call_history (history_id, call_id, owner_user_id, initiator_user_id, call_type, direction, call_status, participant_user_ids, participant_count, started_at, ended_at, duration_seconds, room_id, conversation_id, created_at, updated_at) VALUES ("
+                << "'" << shell_escape_single_quotes(hash_to_uuid("call-history-" + canonical_participant_user_id + "-" + call_id)) << "','"
+                << escaped_call_id << "','" << escaped_owner_user_id << "','" << escaped_initiator_user_id << "','"
+                << escaped_call_type << "','" << direction << "','" << escaped_status << "','"
+                << escaped_participants_csv << "'," << static_cast<int>(participant_user_ids.size()) << ",'"
+                << escaped_started_at << "'::timestamptz," << ended_at_sql << "," << duration_seconds << ","
+                << room_id_sql << "," << conversation_id_sql << ",NOW(),NOW()) "
+                << "ON CONFLICT (owner_user_id, call_id) DO UPDATE SET "
+                << "initiator_user_id=EXCLUDED.initiator_user_id,"
+                << "call_type=EXCLUDED.call_type,"
+                << "direction=EXCLUDED.direction,"
+                << "call_status=EXCLUDED.call_status,"
+                << "participant_user_ids=EXCLUDED.participant_user_ids,"
+                << "participant_count=EXCLUDED.participant_count,"
+                << "started_at=EXCLUDED.started_at,"
+                << "ended_at=EXCLUDED.ended_at,"
+                << "duration_seconds=EXCLUDED.duration_seconds,"
+                << "room_id=EXCLUDED.room_id,"
+                << "conversation_id=EXCLUDED.conversation_id,"
+                << "updated_at=NOW();";
+        }
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ('"
+            << shell_escape_single_quotes(hash_to_uuid("call-history-recorded-" + call_id + "-" + now)) << "','user_call_history','"
+            << escaped_initiator_user_id << "','user.call_history_recorded','{\"callId\":\""
+            << escaped_call_id << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+    }
+
+    std::vector<CallHistoryRecord> list_call_history(const std::string& owner_user_id, const int limit, const int offset) const {
+        if (!enabled_) {
+            return {};
+        }
+        std::ostringstream sql;
+        sql << "SELECT history_id::text, call_id, owner_user_id::text, initiator_user_id::text, call_type, direction, call_status, "
+            << "participant_user_ids, participant_count::text, "
+            << "to_char(started_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
+            << "COALESCE(to_char(ended_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),''), "
+            << "duration_seconds::text, COALESCE(room_id,''), COALESCE(conversation_id,''), "
+            << "to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
+            << "to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') "
+            << "FROM user_call_history WHERE owner_user_id='" << shell_escape_single_quotes(owner_user_id) << "' "
+            << "ORDER BY started_at DESC, updated_at DESC LIMIT " << std::max(limit, 0) << " OFFSET " << std::max(offset, 0) << ";";
+        const auto rows = query_rows(sql.str());
+        if (!rows.has_value()) {
+            return {};
+        }
+        std::vector<CallHistoryRecord> items;
+        items.reserve(rows->size());
+        for (const auto& row : *rows) {
+            if (row.size() != 16U) {
+                throw std::runtime_error("Unexpected call history row shape");
+            }
+            items.push_back(CallHistoryRecord{
+                .history_id = row[0],
+                .call_id = row[1],
+                .owner_user_id = row[2],
+                .initiator_user_id = row[3],
+                .call_type = row[4],
+                .direction = row[5],
+                .status = row[6],
+                .participant_user_ids = split_string(row[7], ','),
+                .participant_count = std::stoi(row[8]),
+                .started_at = row[9],
+                .ended_at = row[10].empty() ? std::nullopt : std::optional<std::string>(row[10]),
+                .duration_seconds = std::stoi(row[11]),
+                .room_id = row[12].empty() ? std::nullopt : std::optional<std::string>(row[12]),
+                .conversation_id = row[13].empty() ? std::nullopt : std::optional<std::string>(row[13]),
+                .created_at = row[14],
+                .updated_at = row[15],
+            });
+        }
+        return items;
+    }
+
+    bool delete_call_history(const std::string& owner_user_id, const std::string& history_id) const {
+        if (!enabled_) {
+            return false;
+        }
+        const auto now = now_iso8601();
+        std::ostringstream sql;
+        sql << "WITH deleted AS (DELETE FROM user_call_history WHERE owner_user_id='" << shell_escape_single_quotes(owner_user_id)
+            << "' AND history_id='" << shell_escape_single_quotes(history_id) << "' RETURNING call_id) "
+            << ", event_insert AS ("
+            << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) "
+            << "SELECT '" << shell_escape_single_quotes(hash_to_uuid("call-history-deleted-" + owner_user_id + "-" + history_id + "-" + now)) << "',"
+            << "'user_call_history','" << shell_escape_single_quotes(owner_user_id) << "','user.call_history_deleted',"
+            << "'{\"historyId\":\"" << shell_escape_single_quotes(history_id) << "\"}'::jsonb,NOW(),NULL "
+            << "FROM deleted RETURNING 1) "
+            << "SELECT COUNT(*)::text FROM deleted;";
+        return query_scalar(sql.str()) == std::optional<std::string>("1");
+    }
+
+    int clear_call_history(const std::string& owner_user_id) const {
+        if (!enabled_) {
+            return 0;
+        }
+        const auto now = now_iso8601();
+        std::ostringstream sql;
+        sql << "WITH deleted AS (DELETE FROM user_call_history WHERE owner_user_id='" << shell_escape_single_quotes(owner_user_id) << "' RETURNING history_id) "
+            << ", event_insert AS ("
+            << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) "
+            << "SELECT '" << shell_escape_single_quotes(hash_to_uuid("call-history-cleared-" + owner_user_id + "-" + now)) << "',"
+            << "'user_call_history','" << shell_escape_single_quotes(owner_user_id) << "','user.call_history_cleared',"
+            << "'{\"userId\":\"" << shell_escape_single_quotes(owner_user_id) << "\"}'::jsonb,NOW(),NULL "
+            << "FROM (SELECT COUNT(*) AS deleted_rows FROM deleted) counts WHERE counts.deleted_rows > 0 RETURNING 1) "
+            << "SELECT COUNT(*)::text FROM deleted;";
+        const auto deleted = query_scalar(sql.str());
+        return deleted.has_value() ? std::stoi(*deleted) : 0;
     }
 
     bool has_block(const std::string& user_id, const std::string& target_user_id) const {
@@ -1508,6 +1708,7 @@ private:
     std::unordered_map<std::string, RelationshipRecord> relationships_;
     std::unordered_map<std::string, BlockRecord> blocks_;
     std::unordered_map<std::string, ProjectionRecord> projections_;
+    std::unordered_map<std::string, CallHistoryRecord> call_history_;
     std::unordered_map<std::string, DeviceSession> sessions_;
     std::vector<JsonObject> outbox_;
     std::vector<JsonObject> audit_log_;
@@ -1973,6 +2174,15 @@ private:
         if (request.method == "GET" && request.path == "/v1/users/me/conversations") {
             return list_projection_entities(request, "conversation");
         }
+        if (request.method == "GET" && request.path == "/v1/users/me/call-history") {
+            return list_my_call_history(request);
+        }
+        if (request.method == "DELETE" && request.path == "/v1/users/me/call-history") {
+            return clear_my_call_history(request);
+        }
+        if (starts_with(request.path, "/v1/users/me/call-history/") && request.method == "DELETE") {
+            return delete_my_call_history(request);
+        }
         if (request.method == "GET" && request.path == "/v1/users/me/friends") {
             return list_relationship_collection(request, "accepted", "friend.list");
         }
@@ -2392,6 +2602,150 @@ private:
         };
     }
 
+    Json call_history_to_json(const CallHistoryRecord& record) {
+        JsonArray participants;
+        for (const auto& participant_user_id : record.participant_user_ids) {
+            if (db_.enabled()) {
+                const auto& profile = ensure_db_profile_exists_and_load(participant_user_id, std::nullopt);
+                participants.emplace_back(JsonObject{
+                    {"userId", required_string(profile, "userId")},
+                    {"displayName", required_string(profile, "displayName")},
+                    {"avatarObjectId", profile.at("avatarObjectId")},
+                    {"profileStatus", required_string(profile, "profileStatus")},
+                });
+                continue;
+            }
+            const auto& profile = require_profile_const(participant_user_id);
+            participants.emplace_back(JsonObject{
+                {"userId", profile.user_id},
+                {"displayName", profile.display_name},
+                {"avatarObjectId", profile.avatar_object_id.has_value() ? Json(*profile.avatar_object_id) : Json(nullptr)},
+                {"profileStatus", profile.profile_status},
+            });
+        }
+        return JsonObject{
+            {"historyId", record.history_id},
+            {"callId", record.call_id},
+            {"ownerUserId", record.owner_user_id},
+            {"initiatorUserId", record.initiator_user_id},
+            {"callType", record.call_type},
+            {"direction", record.direction},
+            {"status", record.status},
+            {"participantCount", record.participant_count},
+            {"participants", participants},
+            {"startedAt", record.started_at},
+            {"endedAt", record.ended_at.has_value() ? Json(*record.ended_at) : Json(nullptr)},
+            {"durationSec", record.duration_seconds},
+            {"roomId", record.room_id.has_value() ? Json(*record.room_id) : Json(nullptr)},
+            {"conversationId", record.conversation_id.has_value() ? Json(*record.conversation_id) : Json(nullptr)},
+            {"createdAt", record.created_at},
+            {"updatedAt", record.updated_at},
+        };
+    }
+
+    std::vector<std::string> normalize_participant_user_ids(
+        const std::vector<std::string>& participant_user_ids,
+        const std::string& initiator_user_id) const {
+        std::vector<std::string> normalized;
+        std::set<std::string> seen;
+        for (const auto& value : participant_user_ids) {
+            const auto canonical = canonical_user_id(value);
+            if (seen.insert(canonical).second) {
+                normalized.push_back(canonical);
+            }
+        }
+        if (seen.insert(initiator_user_id).second) {
+            normalized.insert(normalized.begin(), initiator_user_id);
+        }
+        if (normalized.empty()) {
+            throw std::runtime_error("participantUserIds must not be empty");
+        }
+        return normalized;
+    }
+
+    void upsert_memory_call_history(
+        const std::string& call_id,
+        const std::string& initiator_user_id,
+        const std::vector<std::string>& participant_user_ids,
+        const std::string& call_type,
+        const std::string& status,
+        const std::string& started_at,
+        const std::optional<std::string>& ended_at,
+        const int duration_seconds,
+        const std::optional<std::string>& room_id,
+        const std::optional<std::string>& conversation_id) {
+        const auto timestamp = now_iso8601();
+        for (const auto& owner_user_id : participant_user_ids) {
+            const std::string key = pair_key(owner_user_id, call_id);
+            const auto existing = call_history_.find(key);
+            const std::string created_at = existing != call_history_.end() ? existing->second.created_at : timestamp;
+            call_history_[key] = CallHistoryRecord{
+                .history_id = hash_to_uuid("call-history-" + owner_user_id + "-" + call_id),
+                .call_id = call_id,
+                .owner_user_id = owner_user_id,
+                .initiator_user_id = initiator_user_id,
+                .call_type = call_type,
+                .direction = owner_user_id == initiator_user_id ? "outgoing" : "incoming",
+                .status = status,
+                .participant_user_ids = participant_user_ids,
+                .participant_count = static_cast<int>(participant_user_ids.size()),
+                .started_at = started_at,
+                .ended_at = ended_at,
+                .duration_seconds = duration_seconds,
+                .room_id = room_id,
+                .conversation_id = conversation_id,
+                .created_at = created_at,
+                .updated_at = timestamp,
+            };
+        }
+    }
+
+    std::vector<CallHistoryRecord> list_memory_call_history(const std::string& owner_user_id, const int limit, const int offset) const {
+        std::vector<CallHistoryRecord> items;
+        for (const auto& [key, record] : call_history_) {
+            if (record.owner_user_id == owner_user_id) {
+                items.push_back(record);
+            }
+        }
+        std::sort(items.begin(), items.end(), [](const CallHistoryRecord& lhs, const CallHistoryRecord& rhs) {
+            if (lhs.started_at == rhs.started_at) {
+                return lhs.updated_at > rhs.updated_at;
+            }
+            return lhs.started_at > rhs.started_at;
+        });
+        const int safe_offset = std::max(offset, 0);
+        const int safe_limit = std::max(limit, 0);
+        if (safe_offset >= static_cast<int>(items.size())) {
+            return {};
+        }
+        const auto begin = items.begin() + safe_offset;
+        const auto end = begin + std::min(safe_limit, static_cast<int>(items.end() - begin));
+        return std::vector<CallHistoryRecord>(begin, end);
+    }
+
+    bool delete_memory_call_history(const std::string& owner_user_id, const std::string& history_id) {
+        for (auto it = call_history_.begin(); it != call_history_.end(); ++it) {
+            if (it->second.owner_user_id == owner_user_id && it->second.history_id == history_id) {
+                call_history_.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int clear_memory_call_history(const std::string& owner_user_id) {
+        int deleted = 0;
+        for (auto it = call_history_.begin(); it != call_history_.end();) {
+            if (it->second.owner_user_id == owner_user_id) {
+                it = call_history_.erase(it);
+                ++deleted;
+            } else {
+                ++it;
+            }
+        }
+        return deleted;
+    }
+
     void validate_display_name(const std::string& display_name) const {
         if (display_name.empty() || display_name.size() > 64) {
             throw std::runtime_error("displayName must be 1..64 characters");
@@ -2441,6 +2795,20 @@ private:
         static const std::set<std::string> allowed = {"public", "friends_only", "private"};
         if (!allowed.count(value)) {
             throw std::runtime_error("Invalid avatarVisibility");
+        }
+    }
+
+    void validate_call_type(const std::string& value) const {
+        static const std::set<std::string> allowed = {"audio", "video"};
+        if (!allowed.count(value)) {
+            throw std::runtime_error("Invalid callType");
+        }
+    }
+
+    void validate_call_status(const std::string& value) const {
+        static const std::set<std::string> allowed = {"completed", "missed", "cancelled", "declined", "ongoing"};
+        if (!allowed.count(value)) {
+            throw std::runtime_error("Invalid callStatus");
         }
     }
 
@@ -2812,6 +3180,69 @@ private:
                 increment_metric("profile.deleted");
             }
             return json_response(200, JsonObject{{"status", "updated"}, {"userId", user_id}});
+        }
+
+        if (type == "call.history_recorded") {
+            const std::string call_id = required_string(payload, "callId");
+            const std::string initiator_user_id = canonical_user_id(required_string(payload, "initiatorUserId"));
+            const std::vector<std::string> participant_user_ids = normalize_participant_user_ids(
+                required_string_array(payload, "participantUserIds"),
+                initiator_user_id);
+            const std::string call_type = required_string(payload, "callType");
+            const std::string call_status = required_string(payload, "callStatus");
+            const std::string started_at = required_string(payload, "startedAt");
+            const auto ended_at = optional_string(payload, "endedAt");
+            const auto room_id = optional_string(payload, "roomId");
+            const auto conversation_id = optional_string(payload, "conversationId");
+            int duration_seconds = 0;
+            const auto duration_it = payload.find("durationSec");
+            if (duration_it != payload.end()) {
+                if (!duration_it->second.is_number()) {
+                    throw std::runtime_error("Expected number field: durationSec");
+                }
+                duration_seconds = std::max(0, static_cast<int>(duration_it->second.as_number()));
+            }
+            validate_call_type(call_type);
+            validate_call_status(call_status);
+            for (const auto& participant_user_id : participant_user_ids) {
+                if (db_.enabled()) {
+                    db_.ensure_profile_exists(participant_user_id, "User " + participant_user_id.substr(0, std::min<std::size_t>(8, participant_user_id.size())));
+                } else {
+                    ensure_memory_profile_exists(participant_user_id, std::nullopt);
+                }
+            }
+            if (db_.enabled()) {
+                db_.upsert_call_history(
+                    call_id,
+                    initiator_user_id,
+                    participant_user_ids,
+                    call_type,
+                    call_status,
+                    started_at,
+                    ended_at,
+                    duration_seconds,
+                    room_id,
+                    conversation_id);
+            } else {
+                upsert_memory_call_history(
+                    call_id,
+                    initiator_user_id,
+                    participant_user_ids,
+                    call_type,
+                    call_status,
+                    started_at,
+                    ended_at,
+                    duration_seconds,
+                    room_id,
+                    conversation_id);
+                publish_event("user.call_history_recorded", JsonObject{{"callId", call_id}});
+            }
+            increment_metric("call_history.recorded");
+            return json_response(200, JsonObject{
+                {"status", "recorded"},
+                {"callId", call_id},
+                {"participantCount", static_cast<int>(participant_user_ids.size())},
+            });
         }
 
         if (type == "room.member_added" || type == "conversation.member_added") {
@@ -3369,6 +3800,61 @@ private:
         }
         increment_metric("projection.list." + entity_type);
         return json_response(200, JsonObject{{"items", items}, {"limit", limit}, {"offset", offset}});
+    }
+
+    Response list_my_call_history(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const int limit = parse_int_query(request.query, "limit", 50);
+        const int offset = parse_int_query(request.query, "offset", 0);
+        JsonArray items;
+        if (db_.enabled()) {
+            for (const auto& item : db_.list_call_history(actor_user_id, limit, offset)) {
+                items.emplace_back(call_history_to_json(item));
+            }
+        } else {
+            for (const auto& item : list_memory_call_history(actor_user_id, limit, offset)) {
+                items.emplace_back(call_history_to_json(item));
+            }
+        }
+        increment_metric("call_history.list");
+        return json_response(200, JsonObject{{"items", items}, {"limit", limit}, {"offset", offset}});
+    }
+
+    Response delete_my_call_history(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const auto segments = split_path(request.path);
+        if (segments.size() != 5) {
+            return error_response(404, "not_found", "Route not found");
+        }
+        const std::string history_id = segments[4];
+        const bool deleted = db_.enabled()
+            ? db_.delete_call_history(actor_user_id, history_id)
+            : delete_memory_call_history(actor_user_id, history_id);
+        if (!deleted) {
+            return error_response(404, "not_found", "Call history item not found");
+        }
+        if (!db_.enabled()) {
+            publish_event("user.call_history_deleted", JsonObject{{"historyId", history_id}, {"userId", actor_user_id}});
+        }
+        audit("call_history.delete", actor_user_id, actor_user_id);
+        increment_metric("call_history.deleted");
+        return json_response(200, JsonObject{{"status", "deleted"}, {"historyId", history_id}});
+    }
+
+    Response clear_my_call_history(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const int deleted_count = db_.enabled()
+            ? db_.clear_call_history(actor_user_id)
+            : clear_memory_call_history(actor_user_id);
+        if (!db_.enabled() && deleted_count > 0) {
+            publish_event("user.call_history_cleared", JsonObject{{"userId", actor_user_id}, {"deletedCount", deleted_count}});
+        }
+        audit("call_history.clear", actor_user_id, actor_user_id);
+        increment_metric("call_history.cleared");
+        return json_response(200, JsonObject{{"status", "cleared"}, {"deletedCount", deleted_count}});
     }
 
     Response list_relationship_collection(const Request& request, const std::string& status, const std::string& metric_name) {

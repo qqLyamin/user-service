@@ -11,6 +11,7 @@ User domain service in C++20 with a self-contained HTTP server, deploy assets, m
 - Internal relationship authorization API
 - Internal event ingestion with idempotency via `eventId`
 - User-owned entity projection read model for rooms and conversations
+- Per-user call history for audio/video calls with multi-participant snapshots
 - Outbox, audit log, and simple counters exposed via internal endpoints
 - `/health` endpoint with DB-aware readiness semantics
 - Lazy profile bootstrap for JWT-driven smoke flow on `GET /v1/users/me`
@@ -70,6 +71,9 @@ $env:USER_SERVICE_PORT=8080
 - `GET /v1/users/me/rooms?limit=50&offset=0`
 - `GET /v1/users/me/conversations?limit=50&offset=0`
 - `GET /v1/users/me/contacts?limit=50&offset=0`
+- `GET /v1/users/me/call-history?limit=50&offset=0`
+- `DELETE /v1/users/me/call-history`
+- `DELETE /v1/users/me/call-history/{historyId}`
 
 ### Internal
 
@@ -110,6 +114,37 @@ Supported `type` values:
 - `room.member_removed`
 - `conversation.member_added`
 - `conversation.member_removed`
+- `call.history_recorded`
+
+`call.history_recorded` payload example:
+
+```json
+{
+  "type": "call.history_recorded",
+  "eventId": "evt-call-1",
+  "payload": {
+    "callId": "call-1",
+    "initiatorUserId": "11111111-1111-1111-1111-111111111111",
+    "participantUserIds": [
+      "11111111-1111-1111-1111-111111111111",
+      "22222222-2222-2222-2222-222222222222",
+      "33333333-3333-3333-3333-333333333333"
+    ],
+    "callType": "video",
+    "callStatus": "completed",
+    "startedAt": "2026-03-30T10:00:00.000Z",
+    "endedAt": "2026-03-30T10:25:00.000Z",
+    "durationSec": 1500,
+    "conversationId": "conv-1",
+    "roomId": null
+  }
+}
+```
+
+Notes:
+
+- The event is an upsert by `(ownerUserId, callId)`, so producers can resend the same `callId` when participants expand from 1-1 to `+1/+N`.
+- A row is stored for each participant, and each user can delete only their own copy through the public API.
 
 ## Design notes
 

@@ -243,6 +243,41 @@ def main() -> int:
         assert len(conversations["items"]) == 1
         assert conversations["items"][0]["entityId"] == "conv-1"
 
+        post_event("call.history_recorded", "evt-6a", {
+            "callId": "call-1",
+            "initiatorUserId": alice,
+            "participantUserIds": [alice, bob, charlie],
+            "callType": "video",
+            "callStatus": "completed",
+            "startedAt": "2026-03-30T10:00:00.000Z",
+            "endedAt": "2026-03-30T10:25:00.000Z",
+            "durationSec": 1500,
+            "conversationId": "conv-1",
+        })
+
+        alice_history = request("GET", "/v1/users/me/call-history?limit=10&offset=0", user_id=alice)
+        assert len(alice_history["items"]) == 1
+        assert alice_history["items"][0]["callId"] == "call-1"
+        assert alice_history["items"][0]["callType"] == "video"
+        assert alice_history["items"][0]["participantCount"] == 3
+        assert {participant["userId"] for participant in alice_history["items"][0]["participants"]} == {alice, bob, charlie}
+
+        bob_history = request("GET", "/v1/users/me/call-history?limit=10&offset=0", user_id=bob)
+        assert len(bob_history["items"]) == 1
+        assert bob_history["items"][0]["direction"] == "incoming"
+
+        delete_result = request("DELETE", f"/v1/users/me/call-history/{alice_history['items'][0]['historyId']}", user_id=alice)
+        assert delete_result["status"] == "deleted"
+        alice_history_after_delete = request("GET", "/v1/users/me/call-history?limit=10&offset=0", user_id=alice)
+        assert alice_history_after_delete["items"] == []
+        bob_history_after_delete = request("GET", "/v1/users/me/call-history?limit=10&offset=0", user_id=bob)
+        assert len(bob_history_after_delete["items"]) == 1
+        clear_result = request("DELETE", "/v1/users/me/call-history", user_id=bob)
+        assert clear_result["status"] == "cleared"
+        assert clear_result["deletedCount"] == 1
+        bob_history_after_clear = request("GET", "/v1/users/me/call-history?limit=10&offset=0", user_id=bob)
+        assert bob_history_after_clear["items"] == []
+
         blocked = request("POST", f"/v1/users/{bob}/block", {"reason": "abuse"}, user_id=alice, expected_status=201)
         assert blocked["status"] == "blocked"
 
@@ -285,6 +320,9 @@ def main() -> int:
             "user.friend_request_accepted",
             "user.block_created",
             "user.block_removed",
+            "user.call_history_recorded",
+            "user.call_history_deleted",
+            "user.call_history_cleared",
             "user.privacy_updated",
             "user.disabled",
             "user.deleted",
@@ -301,6 +339,8 @@ def main() -> int:
             "friend_request.decline",
             "block.create",
             "block.remove",
+            "call_history.delete",
+            "call_history.clear",
         }:
             assert required in actions, required
 
@@ -315,6 +355,9 @@ def main() -> int:
             "friend_request.declined",
             "block.created",
             "block.removed",
+            "call_history.recorded",
+            "call_history.deleted",
+            "call_history.cleared",
             "projection.added",
         ]:
             assert required in counters, required
