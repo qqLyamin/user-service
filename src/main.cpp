@@ -500,6 +500,29 @@ struct DeviceSession {
     std::string updated_at;
 };
 
+struct PresenceSessionRecord {
+    std::string user_id;
+    std::string session_id;
+    std::optional<std::string> device_id;
+    std::string platform = "unknown";
+    std::string state = "connected";
+    std::string last_pulse_at;
+    std::optional<std::string> last_disconnect_at;
+    long long last_pulse_epoch_seconds = 0;
+    std::optional<long long> last_disconnect_epoch_seconds;
+    std::string created_at;
+    std::string updated_at;
+};
+
+struct PresenceSnapshot {
+    std::string user_id;
+    std::string presence = "red";
+    bool is_online = false;
+    std::optional<std::string> last_seen_at;
+    int connected_session_count = 0;
+    int recent_session_count = 0;
+};
+
 struct CallHistoryRecord {
     std::string history_id;
     std::string call_id;
@@ -587,6 +610,18 @@ std::optional<std::string> get_env(const char* key) {
     }
     return std::string(value);
 #endif
+}
+
+int parse_int_env(const char* key, const int fallback) {
+    const auto value = get_env(key);
+    if (!value.has_value()) {
+        return fallback;
+    }
+    try {
+        return std::stoi(*value);
+    } catch (...) {
+        return fallback;
+    }
 }
 
 bool is_uuid_like(const std::string& value) {
@@ -946,8 +981,8 @@ public:
         const auto result = query_scalar(
             "SELECT COUNT(*)::text FROM information_schema.tables "
             "WHERE table_schema='public' AND table_name IN ("
-            "'user_profiles','user_privacy_settings','user_relationships','user_blocks','user_entity_projection','user_call_history','user_event_outbox');");
-        return result.has_value() && *result == "7";
+            "'user_profiles','user_privacy_settings','user_relationships','user_blocks','user_entity_projection','user_call_history','user_presence_sessions','user_event_outbox');");
+        return result.has_value() && *result == "8";
     }
 
     std::optional<JsonObject> get_profile(const std::string& user_id) const {
@@ -1011,6 +1046,89 @@ public:
             {"createdAt", columns[6]},
             {"updatedAt", columns[7]},
         };
+    }
+
+    void upsert_presence_session(
+        const std::string& user_id,
+        const std::string& session_id,
+        const std::optional<std::string>& device_id,
+        const std::string& platform) const {
+        if (!enabled_) {
+            return;
+        }
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "INSERT INTO user_presence_sessions (user_id, session_id, device_id, platform, state, last_pulse_at, last_disconnect_at, created_at, updated_at) VALUES ('"
+            << shell_escape_single_quotes(user_id) << "','" << shell_escape_single_quotes(session_id) << "',"
+            << (device_id.has_value() ? "'" + shell_escape_single_quotes(*device_id) + "'" : "NULL") << ",'"
+            << shell_escape_single_quotes(platform) << "','connected',NOW(),NULL,NOW(),NOW()) "
+            << "ON CONFLICT (user_id, session_id) DO UPDATE SET "
+            << "device_id=EXCLUDED.device_id,"
+            << "platform=EXCLUDED.platform,"
+            << "state='connected',"
+            << "last_pulse_at=NOW(),"
+            << "last_disconnect_at=NULL,"
+            << "updated_at=NOW();";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+    }
+
+    bool disconnect_presence_session(const std::string& user_id, const std::string& session_id) const {
+        if (!enabled_) {
+            return false;
+        }
+        std::ostringstream sql;
+        sql << "UPDATE user_presence_sessions SET state='disconnected', last_disconnect_at=NOW(), updated_at=NOW() "
+            << "WHERE user_id='" << shell_escape_single_quotes(user_id) << "' "
+            << "AND session_id='" << shell_escape_single_quotes(session_id) << "' "
+            << "RETURNING 1;";
+        const auto rows = query_rows(sql.str());
+        return rows.has_value() && !rows->empty();
+    }
+
+    std::vector<PresenceSnapshot> list_presence(const std::vector<std::string>& user_ids, const int green_ttl_seconds) const {
+        if (!enabled_ || user_ids.empty()) {
+            return {};
+        }
+        std::ostringstream in_clause;
+        for (std::size_t i = 0; i < user_ids.size(); ++i) {
+            if (i != 0U) {
+                in_clause << ",";
+            }
+            in_clause << "'" << shell_escape_single_quotes(user_ids[i]) << "'";
+        }
+        std::ostringstream sql;
+        sql << "SELECT user_id::text, "
+            << "CASE "
+            << "WHEN COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << std::max(green_ttl_seconds, 1) << " seconds') > 0 THEN 'green' "
+            << "WHEN COUNT(*) FILTER (WHERE state='connected') > 0 THEN 'yellow' "
+            << "ELSE 'red' END, "
+            << "CASE WHEN COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << std::max(green_ttl_seconds, 1) << " seconds') > 0 THEN 'true' ELSE 'false' END, "
+            << "COALESCE(to_char(MAX(COALESCE(last_disconnect_at, last_pulse_at)) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),''), "
+            << "COUNT(*) FILTER (WHERE state='connected')::text, "
+            << "COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << std::max(green_ttl_seconds, 1) << " seconds')::text "
+            << "FROM user_presence_sessions WHERE user_id IN (" << in_clause.str() << ") "
+            << "GROUP BY user_id;";
+        const auto rows = query_rows(sql.str());
+        if (!rows.has_value()) {
+            return {};
+        }
+        std::vector<PresenceSnapshot> items;
+        items.reserve(rows->size());
+        for (const auto& row : *rows) {
+            if (row.size() != 6U) {
+                throw std::runtime_error("Unexpected presence row shape");
+            }
+            items.push_back(PresenceSnapshot{
+                .user_id = row[0],
+                .presence = row[1],
+                .is_online = row[2] == "true",
+                .last_seen_at = row[3].empty() ? std::nullopt : std::optional<std::string>(row[3]),
+                .connected_session_count = std::stoi(row[4]),
+                .recent_session_count = std::stoi(row[5]),
+            });
+        }
+        return items;
     }
 
     void upsert_call_history(
@@ -1703,12 +1821,14 @@ private:
     std::optional<std::string> internal_jwt_audience_ = get_env("INTERNAL_JWT_AUDIENCE");
     std::optional<std::string> internal_jwt_secret_ = get_env("INTERNAL_JWT_SECRET");
     std::optional<std::string> internal_token_ = get_env("INTERNAL_TOKEN");
+    int presence_green_ttl_seconds_ = parse_int_env("PRESENCE_GREEN_TTL_SECONDS", 30);
     std::unordered_map<std::string, UserProfile> profiles_;
     std::unordered_map<std::string, PrivacySettings> privacy_;
     std::unordered_map<std::string, RelationshipRecord> relationships_;
     std::unordered_map<std::string, BlockRecord> blocks_;
     std::unordered_map<std::string, ProjectionRecord> projections_;
     std::unordered_map<std::string, CallHistoryRecord> call_history_;
+    std::unordered_map<std::string, PresenceSessionRecord> presence_sessions_;
     std::unordered_map<std::string, DeviceSession> sessions_;
     std::vector<JsonObject> outbox_;
     std::vector<JsonObject> audit_log_;
@@ -2167,6 +2287,15 @@ private:
         }
         if (request.method == "PATCH" && request.path == "/v1/users/me/privacy") {
             return patch_my_privacy(request);
+        }
+        if (request.method == "POST" && request.path == "/v1/users/me/presence/pulse") {
+            return pulse_my_presence(request);
+        }
+        if (request.method == "POST" && request.path == "/v1/users/me/presence/disconnect") {
+            return disconnect_my_presence(request);
+        }
+        if (request.method == "POST" && request.path == "/v1/users/presence/query") {
+            return query_presence(request);
         }
         if (request.method == "GET" && request.path == "/v1/users/me/rooms") {
             return list_projection_entities(request, "room");
@@ -2643,6 +2772,17 @@ private:
         };
     }
 
+    Json presence_to_json(const PresenceSnapshot& snapshot) const {
+        return JsonObject{
+            {"userId", snapshot.user_id},
+            {"presence", snapshot.presence},
+            {"isOnline", snapshot.is_online},
+            {"lastSeenAt", snapshot.last_seen_at.has_value() ? Json(*snapshot.last_seen_at) : Json(nullptr)},
+            {"connectedSessionCount", snapshot.connected_session_count},
+            {"recentSessionCount", snapshot.recent_session_count},
+        };
+    }
+
     std::vector<std::string> normalize_participant_user_ids(
         const std::vector<std::string>& participant_user_ids,
         const std::string& initiator_user_id) const {
@@ -2744,6 +2884,88 @@ private:
             }
         }
         return deleted;
+    }
+
+    void upsert_memory_presence_session(
+        const std::string& user_id,
+        const std::string& session_id,
+        const std::optional<std::string>& device_id,
+        const std::string& platform) {
+        const auto timestamp = now_iso8601();
+        const auto epoch_seconds = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();
+        const std::string key = pair_key(user_id, session_id);
+        const auto existing = presence_sessions_.find(key);
+        const std::string created_at = existing != presence_sessions_.end() ? existing->second.created_at : timestamp;
+        presence_sessions_[key] = PresenceSessionRecord{
+            .user_id = user_id,
+            .session_id = session_id,
+            .device_id = device_id,
+            .platform = platform,
+            .state = "connected",
+            .last_pulse_at = timestamp,
+            .last_disconnect_at = std::nullopt,
+            .last_pulse_epoch_seconds = epoch_seconds,
+            .last_disconnect_epoch_seconds = std::nullopt,
+            .created_at = created_at,
+            .updated_at = timestamp,
+        };
+    }
+
+    bool disconnect_memory_presence_session(const std::string& user_id, const std::string& session_id) {
+        const std::string key = pair_key(user_id, session_id);
+        const auto it = presence_sessions_.find(key);
+        if (it == presence_sessions_.end()) {
+            return false;
+        }
+        const auto timestamp = now_iso8601();
+        const auto epoch_seconds = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();
+        it->second.state = "disconnected";
+        it->second.last_disconnect_at = timestamp;
+        it->second.last_disconnect_epoch_seconds = epoch_seconds;
+        it->second.updated_at = timestamp;
+        return true;
+    }
+
+    std::vector<PresenceSnapshot> list_memory_presence(const std::vector<std::string>& user_ids) const {
+        std::vector<PresenceSnapshot> items;
+        const auto now_seconds = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();
+        for (const auto& user_id : user_ids) {
+            int connected_session_count = 0;
+            int recent_session_count = 0;
+            std::optional<long long> last_seen_epoch_seconds;
+            std::optional<std::string> last_seen_at;
+            for (const auto& [key, session] : presence_sessions_) {
+                if (session.user_id != user_id) {
+                    continue;
+                }
+                const auto session_last_seen_epoch = session.last_disconnect_epoch_seconds.has_value()
+                    ? std::max(session.last_pulse_epoch_seconds, *session.last_disconnect_epoch_seconds)
+                    : session.last_pulse_epoch_seconds;
+                const auto session_last_seen_at = session.last_disconnect_epoch_seconds.has_value() && *session.last_disconnect_epoch_seconds >= session.last_pulse_epoch_seconds
+                    ? session.last_disconnect_at
+                    : std::optional<std::string>(session.last_pulse_at);
+                if (!last_seen_epoch_seconds.has_value() || session_last_seen_epoch > *last_seen_epoch_seconds) {
+                    last_seen_epoch_seconds = session_last_seen_epoch;
+                    last_seen_at = session_last_seen_at;
+                }
+                if (session.state == "connected") {
+                    ++connected_session_count;
+                    if ((now_seconds - session.last_pulse_epoch_seconds) <= presence_green_ttl_seconds_) {
+                        ++recent_session_count;
+                    }
+                }
+            }
+            const std::string presence = recent_session_count > 0 ? "green" : (connected_session_count > 0 ? "yellow" : "red");
+            items.push_back(PresenceSnapshot{
+                .user_id = user_id,
+                .presence = presence,
+                .is_online = recent_session_count > 0,
+                .last_seen_at = last_seen_at,
+                .connected_session_count = connected_session_count,
+                .recent_session_count = recent_session_count,
+            });
+        }
+        return items;
     }
 
     void validate_display_name(const std::string& display_name) const {
@@ -3800,6 +4022,89 @@ private:
         }
         increment_metric("projection.list." + entity_type);
         return json_response(200, JsonObject{{"items", items}, {"limit", limit}, {"offset", offset}});
+    }
+
+    Response pulse_my_presence(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        const std::string session_id = required_string(object, "sessionId");
+        const auto device_id = optional_string(object, "deviceId");
+        const std::string platform = optional_string(object, "platform").value_or("unknown");
+        if (db_.enabled()) {
+            db_.upsert_presence_session(actor_user_id, session_id, device_id, platform);
+        } else {
+            upsert_memory_presence_session(actor_user_id, session_id, device_id, platform);
+        }
+        increment_metric("presence.pulse");
+        return json_response(200, JsonObject{
+            {"status", "ok"},
+            {"userId", actor_user_id},
+            {"sessionId", session_id},
+            {"presence", "green"},
+            {"isOnline", true},
+        });
+    }
+
+    Response disconnect_my_presence(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        const std::string session_id = required_string(object, "sessionId");
+        const bool updated = db_.enabled()
+            ? db_.disconnect_presence_session(actor_user_id, session_id)
+            : disconnect_memory_presence_session(actor_user_id, session_id);
+        if (!updated) {
+            return error_response(404, "not_found", "Presence session not found");
+        }
+        increment_metric("presence.disconnect");
+        return json_response(200, JsonObject{
+            {"status", "ok"},
+            {"userId", actor_user_id},
+            {"sessionId", session_id},
+            {"presence", "red"},
+            {"isOnline", false},
+        });
+    }
+
+    Response query_presence(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        auto requested_user_ids = required_string_array(object, "userIds");
+        if (requested_user_ids.size() > 200U) {
+            return error_response(400, "bad_request", "userIds supports at most 200 items");
+        }
+        std::vector<std::string> normalized_user_ids;
+        std::set<std::string> seen;
+        for (const auto& raw_user_id : requested_user_ids) {
+            const auto user_id = canonical_user_id(raw_user_id);
+            if (seen.insert(user_id).second) {
+                normalized_user_ids.push_back(user_id);
+            }
+        }
+        std::vector<PresenceSnapshot> snapshots = db_.enabled()
+            ? db_.list_presence(normalized_user_ids, presence_green_ttl_seconds_)
+            : list_memory_presence(normalized_user_ids);
+        std::unordered_map<std::string, PresenceSnapshot> by_user_id;
+        for (const auto& snapshot : snapshots) {
+            by_user_id[snapshot.user_id] = snapshot;
+        }
+        JsonArray items;
+        for (const auto& user_id : normalized_user_ids) {
+            ensure_profile_exists(user_id);
+            const auto it = by_user_id.find(user_id);
+            if (it != by_user_id.end()) {
+                items.emplace_back(presence_to_json(it->second));
+            } else {
+                items.emplace_back(presence_to_json(PresenceSnapshot{.user_id = user_id}));
+            }
+        }
+        increment_metric("presence.query");
+        return json_response(200, JsonObject{{"items", items}});
     }
 
     Response list_my_call_history(const Request& request) {

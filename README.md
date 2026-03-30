@@ -12,6 +12,7 @@ User domain service in C++20 with a self-contained HTTP server, deploy assets, m
 - Internal event ingestion with idempotency via `eventId`
 - User-owned entity projection read model for rooms and conversations
 - Per-user call history for audio/video calls with multi-participant snapshots
+- Presence read model with `green/yellow/red` aggregation over client sessions
 - Outbox, audit log, and simple counters exposed via internal endpoints
 - `/health` endpoint with DB-aware readiness semantics
 - Lazy profile bootstrap for JWT-driven smoke flow on `GET /v1/users/me`
@@ -68,6 +69,9 @@ $env:USER_SERVICE_PORT=8080
 - `DELETE /v1/users/{userId}/block`
 - `GET /v1/users/me/privacy`
 - `PATCH /v1/users/me/privacy`
+- `POST /v1/users/me/presence/pulse`
+- `POST /v1/users/me/presence/disconnect`
+- `POST /v1/users/presence/query`
 - `GET /v1/users/me/rooms?limit=50&offset=0`
 - `GET /v1/users/me/conversations?limit=50&offset=0`
 - `GET /v1/users/me/contacts?limit=50&offset=0`
@@ -145,6 +149,61 @@ Notes:
 
 - The event is an upsert by `(ownerUserId, callId)`, so producers can resend the same `callId` when participants expand from 1-1 to `+1/+N`.
 - A row is stored for each participant, and each user can delete only their own copy through the public API.
+
+## Presence API
+
+Presence is aggregated per user across client sessions:
+
+- `green`: there is at least one connected session with a recent pulse
+- `yellow`: there is at least one connected session, but no recent pulse
+- `red`: all known sessions are explicitly disconnected, or no presence session exists
+
+The recent pulse threshold defaults to `30` seconds and can be overridden with `PRESENCE_GREEN_TTL_SECONDS`.
+
+Client pulse:
+
+```json
+POST /v1/users/me/presence/pulse
+{
+  "sessionId": "desktop-1",
+  "deviceId": "device-1",
+  "platform": "windows"
+}
+```
+
+Client explicit disconnect:
+
+```json
+POST /v1/users/me/presence/disconnect
+{
+  "sessionId": "desktop-1"
+}
+```
+
+Batch query for friends / room participants / any known user ids:
+
+```json
+POST /v1/users/presence/query
+{
+  "userIds": [
+    "11111111-1111-1111-1111-111111111111",
+    "22222222-2222-2222-2222-222222222222"
+  ]
+}
+```
+
+Response item shape:
+
+```json
+{
+  "userId": "22222222-2222-2222-2222-222222222222",
+  "presence": "green",
+  "isOnline": true,
+  "lastSeenAt": "2026-03-30T12:00:00.000Z",
+  "connectedSessionCount": 1,
+  "recentSessionCount": 1
+}
+```
 
 ## Design notes
 

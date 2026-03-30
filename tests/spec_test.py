@@ -92,6 +92,7 @@ def main() -> int:
     env["JWT_SECRET"] = INTERNAL_JWT_SECRET
     env["JWT_ISSUER"] = INTERNAL_JWT_ISSUER
     env["JWT_AUDIENCE"] = INTERNAL_JWT_AUDIENCE
+    env["PRESENCE_GREEN_TTL_SECONDS"] = "1"
     proc = subprocess.Popen([str(EXE)], cwd=str(ROOT), env=env)
     try:
         wait_for_port("127.0.0.1", 18080)
@@ -129,6 +130,34 @@ def main() -> int:
         me = request("GET", "/v1/users/me", user_id=alice)
         assert me["displayName"] == "Alice"
         assert me["username"] == "alice"
+
+        red_presence = request("POST", "/v1/users/presence/query", {"userIds": [alice, bob]}, user_id=alice)
+        assert red_presence["items"][0]["presence"] == "red"
+        assert red_presence["items"][1]["presence"] == "red"
+
+        pulse = request("POST", "/v1/users/me/presence/pulse", {
+            "sessionId": "alice-desktop",
+            "deviceId": "alice-device",
+            "platform": "windows",
+        }, user_id=alice)
+        assert pulse["presence"] == "green"
+
+        green_presence = request("POST", "/v1/users/presence/query", {"userIds": [alice]}, user_id=bob)
+        assert green_presence["items"][0]["presence"] == "green"
+        assert green_presence["items"][0]["isOnline"] is True
+
+        time.sleep(2.2)
+        yellow_presence = request("POST", "/v1/users/presence/query", {"userIds": [alice]}, user_id=bob)
+        assert yellow_presence["items"][0]["presence"] == "yellow"
+        assert yellow_presence["items"][0]["isOnline"] is False
+
+        disconnect_presence = request("POST", "/v1/users/me/presence/disconnect", {
+            "sessionId": "alice-desktop",
+        }, user_id=alice)
+        assert disconnect_presence["presence"] == "red"
+
+        red_after_disconnect = request("POST", "/v1/users/presence/query", {"userIds": [alice]}, user_id=bob)
+        assert red_after_disconnect["items"][0]["presence"] == "red"
 
         patched = request("PATCH", "/v1/users/me", {
             "displayName": "Alice Cooper",
