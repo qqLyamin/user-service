@@ -1242,6 +1242,11 @@ public:
                 << "room_id=EXCLUDED.room_id,"
                 << "conversation_id=EXCLUDED.conversation_id,"
                 << "updated_at=NOW();";
+            sql << "DELETE FROM user_call_history WHERE history_id IN ("
+                << "SELECT history_id FROM user_call_history "
+                << "WHERE owner_user_id='" << escaped_owner_user_id << "' "
+                << "ORDER BY started_at DESC, updated_at DESC OFFSET 50"
+                << ");";
         }
         sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ('"
             << shell_escape_single_quotes(hash_to_uuid("call-history-recorded-" + call_id + "-" + now)) << "','user_call_history','"
@@ -3307,6 +3312,28 @@ private:
                 .created_at = created_at,
                 .updated_at = timestamp,
             };
+            trim_memory_call_history(owner_user_id, 50);
+        }
+    }
+
+    void trim_memory_call_history(const std::string& owner_user_id, const std::size_t max_items) {
+        std::vector<CallHistoryRecord> items;
+        for (const auto& [key, record] : call_history_) {
+            if (record.owner_user_id == owner_user_id) {
+                items.push_back(record);
+            }
+        }
+        std::sort(items.begin(), items.end(), [](const CallHistoryRecord& lhs, const CallHistoryRecord& rhs) {
+            if (lhs.started_at == rhs.started_at) {
+                return lhs.updated_at > rhs.updated_at;
+            }
+            return lhs.started_at > rhs.started_at;
+        });
+        if (items.size() <= max_items) {
+            return;
+        }
+        for (std::size_t index = max_items; index < items.size(); ++index) {
+            call_history_.erase(pair_key(owner_user_id, items[index].call_id));
         }
     }
 

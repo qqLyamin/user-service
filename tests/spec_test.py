@@ -390,15 +390,39 @@ def main() -> int:
         assert len(bob_history["items"]) == 1
         assert bob_history["items"][0]["direction"] == "incoming"
 
-        delete_result = request("DELETE", f"/v1/users/me/call-history/{alice_history['items'][0]['historyId']}", user_id=alice)
+        for index in range(55):
+            started_hour = 11 + (index // 60)
+            started_minute = index % 60
+            post_event("call.history_recorded", f"evt-call-bulk-{index}", {
+                "callId": f"call-bulk-{index}",
+                "initiatorUserId": alice,
+                "participantUserIds": [alice, bob],
+                "callType": "audio",
+                "callStatus": "completed",
+                "startedAt": f"2026-03-30T{started_hour:02d}:{started_minute:02d}:00.000Z",
+                "endedAt": f"2026-03-30T{started_hour:02d}:{started_minute:02d}:30.000Z",
+                "durationSec": 30,
+                "conversationId": "conv-1",
+            })
+
+        capped_history = request("GET", "/v1/users/me/call-history?limit=100&offset=0", user_id=alice)
+        assert len(capped_history["items"]) == 50
+        capped_call_ids = {item["callId"] for item in capped_history["items"]}
+        assert capped_history["items"][0]["callId"] == "call-bulk-54"
+        assert "call-1" not in capped_call_ids
+        assert "call-bulk-0" not in capped_call_ids
+        assert "call-bulk-4" not in capped_call_ids
+        assert "call-bulk-5" in capped_call_ids
+
+        delete_result = request("DELETE", f"/v1/users/me/call-history/{capped_history['items'][0]['historyId']}", user_id=alice)
         assert delete_result["status"] == "deleted"
         alice_history_after_delete = request("GET", "/v1/users/me/call-history?limit=10&offset=0", user_id=alice)
-        assert alice_history_after_delete["items"] == []
+        assert len(alice_history_after_delete["items"]) == 10
         bob_history_after_delete = request("GET", "/v1/users/me/call-history?limit=10&offset=0", user_id=bob)
-        assert len(bob_history_after_delete["items"]) == 1
+        assert len(bob_history_after_delete["items"]) == 10
         clear_result = request("DELETE", "/v1/users/me/call-history", user_id=bob)
         assert clear_result["status"] == "cleared"
-        assert clear_result["deletedCount"] == 1
+        assert clear_result["deletedCount"] == 50
         bob_history_after_clear = request("GET", "/v1/users/me/call-history?limit=10&offset=0", user_id=bob)
         assert bob_history_after_clear["items"] == []
 
