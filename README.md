@@ -83,11 +83,41 @@ $env:USER_SERVICE_PORT=8080
 
 - `POST /internal/events`
 - `GET /internal/users/{userId}/profile`
+- `POST /internal/users/batch`
 - `POST /internal/users/relationships/check`
 - `POST /internal/users/{userId}/authorize-profile-read`
 - `GET /internal/outbox`
 - `GET /internal/audit-log`
 - `GET /internal/metrics`
+
+## Internal user profile batch
+
+`POST /internal/users/batch`
+
+```json
+{
+  "userIds": [
+    "11111111-1111-1111-1111-111111111111",
+    "22222222-2222-2222-2222-222222222222"
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "users": [
+    {
+      "userId": "11111111-1111-1111-1111-111111111111",
+      "displayName": "IGOR22",
+      "profileStatus": "active"
+    }
+  ]
+}
+```
+
+The endpoint requires internal auth, accepts up to 100 UUID values, preserves first-seen request order, and omits unknown users. Contract errors are `400 {"error":"VALIDATION_ERROR"}`, `401 {"error":"UNAUTHORIZED"}`, and `503 {"error":"USER_SERVICE_UNAVAILABLE"}`.
 
 ## Internal event ingestion
 

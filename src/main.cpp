@@ -2578,6 +2578,9 @@ private:
         if (request.method == "POST" && request.path == "/internal/events") {
             return ingest_event(request);
         }
+        if (request.method == "POST" && request.path == "/internal/users/batch") {
+            return internal_batch_profiles(request);
+        }
         if (starts_with(request.path, "/internal/users/") && ends_with(request.path, "/profile") && request.method == "GET") {
             return internal_get_profile(request);
         }
@@ -4128,6 +4131,80 @@ private:
         }
 
         throw std::runtime_error("Unsupported event type: " + type);
+    }
+
+    Response internal_contract_error_response(const int status, const std::string& error) {
+        increment_metric("http.error." + std::to_string(status));
+        return json_response(status, JsonObject{{"error", error}});
+    }
+
+    JsonObject internal_profile_contract_json(const JsonObject& profile) const {
+        return JsonObject{
+            {"userId", required_string(profile, "userId")},
+            {"displayName", required_string(profile, "displayName")},
+            {"profileStatus", required_string(profile, "profileStatus")},
+        };
+    }
+
+    JsonObject internal_profile_contract_json(const UserProfile& profile) const {
+        return JsonObject{
+            {"userId", profile.user_id},
+            {"displayName", profile.display_name},
+            {"profileStatus", profile.profile_status},
+        };
+    }
+
+    Response internal_batch_profiles(const Request& request) {
+        try {
+            require_internal_token(request);
+        } catch (const std::exception&) {
+            return internal_contract_error_response(401, "UNAUTHORIZED");
+        }
+
+        std::vector<std::string> user_ids;
+        try {
+            const auto body = JsonParser(request.body).parse();
+            const auto& object = require_object(body);
+            const auto requested_user_ids = required_string_array(object, "userIds");
+            if (requested_user_ids.size() > 100U) {
+                return internal_contract_error_response(400, "VALIDATION_ERROR");
+            }
+
+            std::set<std::string> seen;
+            for (const auto& raw_user_id : requested_user_ids) {
+                if (!is_uuid_like(raw_user_id)) {
+                    return internal_contract_error_response(400, "VALIDATION_ERROR");
+                }
+                const auto user_id = canonical_user_id(raw_user_id);
+                if (seen.insert(user_id).second) {
+                    user_ids.push_back(user_id);
+                }
+            }
+        } catch (const std::exception&) {
+            return internal_contract_error_response(400, "VALIDATION_ERROR");
+        }
+
+        try {
+            JsonArray users;
+            if (db_.enabled()) {
+                for (const auto& user_id : user_ids) {
+                    const auto profile = db_.get_profile(user_id);
+                    if (profile.has_value()) {
+                        users.emplace_back(internal_profile_contract_json(*profile));
+                    }
+                }
+            } else {
+                for (const auto& user_id : user_ids) {
+                    const auto profile_it = profiles_.find(user_id);
+                    if (profile_it != profiles_.end()) {
+                        users.emplace_back(internal_profile_contract_json(profile_it->second));
+                    }
+                }
+            }
+            return json_response(200, JsonObject{{"users", users}});
+        } catch (const std::exception&) {
+            return internal_contract_error_response(503, "USER_SERVICE_UNAVAILABLE");
+        }
     }
 
     Response internal_get_profile(const Request& request) {

@@ -272,6 +272,27 @@ def main() -> int:
         alice_internal_profile = request("GET", f"/internal/users/{alice}/profile", internal=True)
         assert alice_internal_profile["avatarObjectId"] == "obj_avatar_alice"
 
+        batch_profiles = request("POST", "/internal/users/batch", {"userIds": [alice, bob, alice.upper()]}, internal=True)
+        assert batch_profiles["users"] == [
+            {"userId": alice, "displayName": "Alice Cooper", "profileStatus": "active"},
+            {"userId": bob, "displayName": "Bob", "profileStatus": "active"},
+        ]
+
+        invalid_batch_uuid = request("POST", "/internal/users/batch", {"userIds": ["not-a-uuid"]}, internal=True, expected_status=400)
+        assert invalid_batch_uuid["error"] == "VALIDATION_ERROR"
+
+        oversized_batch = request("POST", "/internal/users/batch", {"userIds": [alice] * 101}, internal=True, expected_status=400)
+        assert oversized_batch["error"] == "VALIDATION_ERROR"
+
+        unauthorized_batch = raw_request(
+            "POST",
+            "/internal/users/batch",
+            raw_body=json.dumps({"userIds": [alice]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            expected_status=401,
+        )
+        assert unauthorized_batch["error"] == "UNAUTHORIZED"
+
         privacy = request("PATCH", "/v1/users/me/privacy", {
             "profileVisibility": "friends_only",
             "dmPolicy": "friends_only",
@@ -457,6 +478,8 @@ def main() -> int:
         post_event("auth.user_deleted", "evt-9", {"userId": charlie})
         snapshot = request("GET", f"/internal/users/{charlie}/profile", internal=True)
         assert snapshot["profileStatus"] == "deleted"
+        deleted_batch_snapshot = request("POST", "/internal/users/batch", {"userIds": [charlie]}, internal=True)
+        assert deleted_batch_snapshot["users"][0]["profileStatus"] == "deleted"
 
         outbox = request("GET", "/internal/outbox", internal=True)
         event_types = {event["eventType"] for event in outbox["events"]}
