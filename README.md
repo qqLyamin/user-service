@@ -43,10 +43,13 @@ cmake --build build --config Release
 ## Run
 
 ```powershell
-.\build\user-service.exe 8080
+$env:HTTP_ADDR="127.0.0.1:8812"
+.\build\user-service.exe
 ```
 
-or
+`HTTP_ADDR` is the preferred bind setting and is used as an exact IPv4 listen address. `HTTP_ADDR=127.0.0.1:8812` binds only loopback; `HTTP_ADDR=:8812` explicitly binds all interfaces.
+
+Legacy port-only fallback is still supported when `HTTP_ADDR` is not set:
 
 ```powershell
 $env:USER_SERVICE_PORT=8080

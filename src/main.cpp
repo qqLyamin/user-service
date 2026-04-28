@@ -5217,6 +5217,32 @@ std::string build_http_response(const Response& response) {
     return oss.str();
 }
 
+struct ListenAddress {
+    std::string host = "0.0.0.0";
+    unsigned short port = 8080;
+};
+
+ListenAddress parse_http_addr(const std::string& raw_addr) {
+    const std::string value = trim(raw_addr);
+    const auto colon = value.rfind(':');
+    if (colon == std::string::npos || colon + 1 >= value.size()) {
+        throw std::runtime_error("HTTP_ADDR must be host:port or :port");
+    }
+    ListenAddress address;
+    address.host = value.substr(0, colon);
+    address.port = static_cast<unsigned short>(std::stoi(value.substr(colon + 1)));
+    if (address.host.empty()) {
+        address.host = "0.0.0.0";
+    }
+    return address;
+}
+
+ListenAddress listen_address_from_port(const unsigned short port) {
+    ListenAddress address;
+    address.port = port;
+    return address;
+}
+
 bool socket_send_all(SOCKET socket, const std::string& data) {
     std::size_t sent_total = 0;
     while (sent_total < data.size()) {
@@ -5264,7 +5290,16 @@ std::string receive_http_request(SOCKET client_socket) {
     return data;
 }
 
-int run_server(unsigned short port) {
+bool assign_ipv4_address(const std::string& host, sockaddr_in& address) {
+    if (host == "0.0.0.0" || host == "*" || host.empty()) {
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        return true;
+    }
+    const std::string normalized_host = host == "localhost" ? "127.0.0.1" : host;
+    return inet_pton(AF_INET, normalized_host.c_str(), &address.sin_addr) == 1;
+}
+
+int run_server(const ListenAddress& listen_address) {
 #ifdef _WIN32
     WSADATA wsa_data{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
@@ -5292,11 +5327,18 @@ int run_server(unsigned short port) {
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(port);
+    if (!assign_ipv4_address(listen_address.host, address)) {
+        std::cerr << "Invalid HTTP_ADDR host: " << listen_address.host << "\n";
+        closesocket(server_socket);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
+    address.sin_port = htons(listen_address.port);
 
     if (bind(server_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
-        std::cerr << "bind() failed\n";
+        std::cerr << "bind() failed for " << listen_address.host << ":" << listen_address.port << "\n";
         closesocket(server_socket);
 #ifdef _WIN32
         WSACleanup();
@@ -5312,7 +5354,7 @@ int run_server(unsigned short port) {
         return 1;
     }
 
-    std::cout << "user-service listening on port " << port << std::endl;
+    std::cout << "user-service listening on " << listen_address.host << ":" << listen_address.port << std::endl;
     ServiceState state;
 
     while (true) {
@@ -5377,16 +5419,13 @@ int main(int argc, char** argv) {
         std::cerr << "Unknown migrate command\n";
         return 1;
     }
-    unsigned short port = 8080;
-    if (const auto env_port = get_env("USER_SERVICE_PORT")) {
-        port = static_cast<unsigned short>(std::stoi(*env_port));
-    } else if (const auto http_addr = get_env("HTTP_ADDR")) {
-        const auto colon = http_addr->rfind(':');
-        if (colon != std::string::npos) {
-            port = static_cast<unsigned short>(std::stoi(http_addr->substr(colon + 1)));
-        }
+    ListenAddress listen_address;
+    if (const auto http_addr = get_env("HTTP_ADDR")) {
+        listen_address = parse_http_addr(*http_addr);
+    } else if (const auto env_port = get_env("USER_SERVICE_PORT")) {
+        listen_address = listen_address_from_port(static_cast<unsigned short>(std::stoi(*env_port)));
     } else if (argc > 1) {
-        port = static_cast<unsigned short>(std::stoi(argv[1]));
+        listen_address = listen_address_from_port(static_cast<unsigned short>(std::stoi(argv[1])));
     }
-    return run_server(port);
+    return run_server(listen_address);
 }
