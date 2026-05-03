@@ -683,6 +683,15 @@ int parse_int_env(const char* key, const int fallback) {
     }
 }
 
+bool parse_bool_env(const char* key, const bool fallback = false) {
+    const auto value = get_env(key);
+    if (!value.has_value()) {
+        return fallback;
+    }
+    const auto normalized = to_lower(trim(*value));
+    return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+}
+
 bool is_uuid_like(const std::string& value) {
     static const std::regex pattern("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
     return std::regex_match(value, pattern);
@@ -2128,6 +2137,7 @@ private:
     std::optional<std::string> internal_jwt_audience_ = get_env("INTERNAL_JWT_AUDIENCE");
     std::optional<std::string> internal_jwt_secret_ = get_env("INTERNAL_JWT_SECRET");
     std::optional<std::string> internal_token_ = get_env("INTERNAL_TOKEN");
+    bool allow_legacy_user_bearer_ = parse_bool_env("ALLOW_LEGACY_USER_BEARER", false);
     int presence_green_ttl_seconds_ = parse_int_env("PRESENCE_GREEN_TTL_SECONDS", 30);
     int reminder_scan_interval_seconds_ = parse_int_env("REMINDER_SCAN_INTERVAL_SECONDS", 15);
     std::unordered_map<std::string, UserProfile> profiles_;
@@ -2744,7 +2754,7 @@ private:
             throw HttpError(401, "unauthorized", "Missing Authorization header");
         }
         const std::string prefix = "bearer user:";
-        if (header.rfind(prefix, 0) == 0) {
+        if (allow_legacy_user_bearer_ && header.rfind(prefix, 0) == 0) {
             const auto actor_user_id = canonical_user_id(trim(raw_header.substr(prefix.size())));
             current_jwt_principal_ = JwtPrincipal{
                 .raw_user_id = actor_user_id,
@@ -2758,10 +2768,14 @@ private:
             log_auth_result("200", actor_user_id, "allow", "ok", std::nullopt, "legacy", true, true, true);
             return actor_user_id;
         }
+        if (header.rfind(prefix, 0) == 0) {
+            log_auth_result("401", "-", "deny", "legacy_bearer_disabled", std::nullopt, "false", true, true, false);
+            throw HttpError(401, "unauthorized", "Legacy Bearer user tokens are disabled");
+        }
         const std::string bearer_prefix = "bearer ";
         if (header.rfind(bearer_prefix, 0) != 0) {
             log_auth_result("401", "-", "deny", "missing_bearer", std::nullopt, "false", true, false, false);
-            throw HttpError(401, "unauthorized", "Expected Authorization: Bearer <jwt> or Bearer user:<user-id>");
+            throw HttpError(401, "unauthorized", "Expected Authorization: Bearer <jwt>");
         }
         std::optional<JwtPrincipal> principal;
         try {
@@ -2822,7 +2836,10 @@ private:
             return;
         }
         const auto it = request.headers.find("x-internal-token");
-        const std::string expected = internal_token_.value_or("internal-secret");
+        if (!internal_token_.has_value() || trim(*internal_token_).empty()) {
+            throw HttpError(401, "unauthorized", "Internal token authentication is not configured");
+        }
+        const std::string expected = trim(*internal_token_);
         if (it == request.headers.end() || trim(it->second) != expected) {
             throw HttpError(401, "unauthorized", "Missing or invalid internal authentication");
         }
@@ -5256,6 +5273,8 @@ bool socket_send_all(SOCKET socket, const std::string& data) {
 }
 
 std::string receive_http_request(SOCKET client_socket) {
+    constexpr std::size_t max_header_bytes = 64U * 1024U;
+    constexpr std::size_t max_body_bytes = 1024U * 1024U;
     std::string data;
     char buffer[4096];
     int expected_body_length = -1;
@@ -5268,6 +5287,9 @@ std::string receive_http_request(SOCKET client_socket) {
         }
         data.append(buffer, bytes);
         if (header_end == std::string::npos) {
+            if (data.size() > max_header_bytes) {
+                throw std::runtime_error("HTTP headers too large");
+            }
             header_end = data.find("\r\n\r\n");
             if (header_end != std::string::npos) {
                 const auto content_length_pos = to_lower(data.substr(0, header_end)).find("content-length:");
@@ -5275,6 +5297,9 @@ std::string receive_http_request(SOCKET client_socket) {
                     const auto line_end = data.find("\r\n", content_length_pos);
                     const auto value = trim(data.substr(content_length_pos + 15, line_end - (content_length_pos + 15)));
                     expected_body_length = std::stoi(value);
+                    if (expected_body_length < 0 || static_cast<std::size_t>(expected_body_length) > max_body_bytes) {
+                        throw std::runtime_error("HTTP request body too large");
+                    }
                 } else {
                     expected_body_length = 0;
                 }
@@ -5284,6 +5309,9 @@ std::string receive_http_request(SOCKET client_socket) {
             const std::size_t received_body_length = data.size() - (header_end + 4);
             if (received_body_length >= static_cast<std::size_t>(expected_body_length)) {
                 break;
+            }
+            if (received_body_length > max_body_bytes) {
+                throw std::runtime_error("HTTP request body too large");
             }
         }
     }
@@ -5385,9 +5413,18 @@ int run_server(const ListenAddress& listen_address) {
         if (client_socket == INVALID_SOCKET) {
             continue;
         }
-        const std::string raw_request = receive_http_request(client_socket);
+#ifdef _WIN32
+        DWORD recv_timeout_ms = 5000;
+        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout_ms), sizeof(recv_timeout_ms));
+#else
+        timeval recv_timeout{};
+        recv_timeout.tv_sec = 5;
+        recv_timeout.tv_usec = 0;
+        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+#endif
         Response response;
         try {
+            const std::string raw_request = receive_http_request(client_socket);
             response = state.handle(parse_request(raw_request));
         } catch (const std::exception& ex) {
             response.status = 400;

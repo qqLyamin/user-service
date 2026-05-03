@@ -51,9 +51,9 @@ The response intentionally contains only the fields premium-service needs:
 Internal endpoints accept the existing internal auth mechanisms:
 
 - preferred: `Authorization: Bearer <internal jwt>`
-- legacy/local fallback: `X-Internal-Token: <token>`
+- legacy/local fallback: `X-Internal-Token: <token>` when `INTERNAL_TOKEN` is configured
 
-For local smoke compatibility the default internal token is still `internal-secret` when `INTERNAL_TOKEN` is not set.
+There is no default `internal-secret` token when `INTERNAL_TOKEN` is not set.
 
 ## Batch behavior
 

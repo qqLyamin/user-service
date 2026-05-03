@@ -42,6 +42,10 @@ def make_internal_token(secret: str, subject: str = "signaling") -> str:
     return f"{signing_input}.{b64url(signature)}"
 
 
+def make_user_token(user_id: str) -> str:
+    return make_internal_token(INTERNAL_JWT_SECRET, user_id)
+
+
 def wait_for_port(host: str, port: int, timeout: float = 10.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -56,7 +60,7 @@ def wait_for_port(host: str, port: int, timeout: float = 10.0) -> None:
 def request(method: str, path: str, body=None, user_id=None, internal=False, internal_token=None, expected_status=200):
     headers = {"Content-Type": "application/json"}
     if user_id is not None:
-        headers["Authorization"] = f"Bearer user:{user_id}"
+        headers["Authorization"] = f"Bearer {make_user_token(user_id)}"
     if internal:
         headers["Authorization"] = f"Bearer {internal_token or make_internal_token(INTERNAL_JWT_SECRET)}"
     payload = None if body is None else json.dumps(body).encode("utf-8")
@@ -151,7 +155,7 @@ def main() -> int:
             "/v1/reminders",
             raw_body=b"{",
             headers={
-                "Authorization": f"Bearer user:{alice}",
+                "Authorization": f"Bearer {make_user_token(alice)}",
                 "Content-Type": "application/json",
             },
             expected_status=400,
