@@ -101,7 +101,6 @@ jobs:
 
             compose_dir="/opt/roommy-stage/user-service"
             env_file="${compose_dir}/user-service.env"
-            compose_file="${compose_dir}/docker-compose.yml"
             legacy_env="/opt/user-service/shared/env/user-service.env"
 
             read_legacy() {
@@ -143,27 +142,41 @@ jobs:
             EOF
             sed -i 's/^            //' "$env_file"
 
-            cat > "$compose_file" <<EOF
-            services:
-              user-service:
-                image: ${IMAGE_REF}
-                container_name: user-service
-                network_mode: host
-                restart: unless-stopped
-                env_file:
-                  - ./user-service.env
-                labels:
-                  roommy.service: user-service
-                  roommy.environment: stage
-                  roommy.commit: ${{ github.sha }}
-            EOF
-            sed -i 's/^            //' "$compose_file"
-
             printf '%s' "$GHCR_TOKEN" | sudo docker login ghcr.io -u "$GHCR_USER" --password-stdin
             sudo docker pull "$IMAGE_REF"
             sudo docker run --rm --network host --env-file "$env_file" "$IMAGE_REF" migrate up
             sudo systemctl disable --now user-service.service || true
-            sudo docker compose -f "$compose_file" up -d --remove-orphans
+
+            container_name="user-service"
+            deploy_id="${{ github.sha }}"
+            previous_container=""
+            if sudo docker container inspect "$container_name" >/dev/null 2>&1; then
+              previous_container="${container_name}-previous-${deploy_id}-$(date +%s)"
+              sudo docker stop "$container_name" || true
+              sudo docker rename "$container_name" "$previous_container"
+            fi
+
+            rollback_previous() {
+              failed_container="${container_name}-failed-${deploy_id}-$(date +%s)"
+              if sudo docker container inspect "$container_name" >/dev/null 2>&1; then
+                sudo docker stop "$container_name" || true
+                sudo docker rename "$container_name" "$failed_container" || true
+              fi
+              if [ -n "$previous_container" ]; then
+                sudo docker rename "$previous_container" "$container_name" || true
+                sudo docker start "$container_name" || true
+              fi
+            }
+
+            sudo docker run -d \
+              --name "$container_name" \
+              --network host \
+              --restart unless-stopped \
+              --env-file "$env_file" \
+              --label "roommy.service=user-service" \
+              --label "roommy.environment=stage" \
+              --label "roommy.commit=${deploy_id}" \
+              "$IMAGE_REF"
 
             for attempt in $(seq 1 30); do
               if curl -fsS "http://127.0.0.1:${{ env.SERVICE_PORT }}/health" >/dev/null; then
@@ -171,7 +184,8 @@ jobs:
               fi
               sleep 2
             done
-            sudo docker logs --tail=200 user-service || true
+            sudo docker logs --tail=200 "$container_name" || true
+            rollback_previous
             exit 1
 
       - name: External healthcheck
