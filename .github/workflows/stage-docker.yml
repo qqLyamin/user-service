@@ -197,6 +197,40 @@ jobs:
               fi
             }
 
+            stop_legacy_port_owner() {
+              port="$1"
+              expected_name="$2"
+              pid="$(sudo ss -ltnp "sport = :${port}" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n1 || true)"
+              if [ -z "$pid" ]; then
+                return 0
+              fi
+
+              if [ -r "/proc/${pid}/cgroup" ] && grep -Eq 'docker|containerd|kubepods' "/proc/${pid}/cgroup"; then
+                echo "Port ${port} is owned by Docker-managed process pid=${pid}; preserving it for container rollback."
+                return 0
+              fi
+
+              comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+              exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+              cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+              if ! printf '%s\n%s\n%s\n' "$comm" "$exe" "$cmdline" | grep -Fq "$expected_name"; then
+                echo "Port ${port} is occupied by unexpected non-Docker process pid=${pid}"
+                sudo ss -ltnp "sport = :${port}" || true
+                ps -fp "$pid" || true
+                exit 1
+              fi
+
+              echo "Stopping legacy ${expected_name} pid=${pid} on port ${port}"
+              sudo kill -TERM "$pid" || true
+              for attempt in $(seq 1 10); do
+                if ! sudo kill -0 "$pid" 2>/dev/null; then
+                  return 0
+                fi
+                sleep 1
+              done
+              sudo kill -KILL "$pid" || true
+            }
+
             assert_container_current() {
               name="$1"
               expected_commit="$2"
@@ -214,6 +248,7 @@ jobs:
             sudo docker pull "$IMAGE_REF"
             sudo docker run --rm --network host --env-file "$env_file" "$IMAGE_REF" migrate up
             stop_legacy_systemd "user-service.service"
+            stop_legacy_port_owner "${{ env.SERVICE_PORT }}" "user-service"
 
             container_name="user-service"
             deploy_id="${{ github.sha }}"
