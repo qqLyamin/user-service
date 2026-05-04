@@ -1,0 +1,178 @@
+name: Stage Docker Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: stage-docker-user-service-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SERVICE_PORT: ${{ vars.SERVICE_PORT || '8812' }}
+  DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+  DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+  DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+  PUBLIC_BASE_HOST: ${{ vars.PUBLIC_BASE_HOST || 'api.roommy.online' }}
+  POSTGRES_HOST: ${{ vars.POSTGRES_HOST || '127.0.0.1' }}
+  POSTGRES_PORT: ${{ vars.POSTGRES_PORT || '5432' }}
+  POSTGRES_DB: ${{ vars.POSTGRES_DB || 'user_service' }}
+  POSTGRES_USER: ${{ vars.POSTGRES_USER || 'user_service_user' }}
+  POSTGRES_SSLMODE: ${{ vars.POSTGRES_SSLMODE || 'disable' }}
+  JWT_ISSUER: ${{ vars.JWT_ISSUER || 'auth-service' }}
+  JWT_AUDIENCE: ${{ vars.JWT_AUDIENCE || 'internal' }}
+
+jobs:
+  test-build-push-deploy:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build python3 postgresql-client
+
+      - name: Run tests
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+          python3 tests/spec_test.py
+          python3 tests/jwt_smoke_test.py
+
+      - name: Prepare image metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_repo="$(printf 'ghcr.io/%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_REPO=${image_repo}" >> "$GITHUB_ENV"
+          echo "IMAGE_REF=${image_repo}:sha-${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_REF }}
+            ${{ env.IMAGE_REPO }}:stage
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            roommy.service=user-service
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload image to stage
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE_REF: ${{ env.IMAGE_REF }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          USER_SERVICE_SECRET: ${{ secrets.USER_SERVICE_SECRET }}
+        with:
+          host: ${{ env.DEPLOY_HOST }}
+          username: ${{ env.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ env.DEPLOY_PORT }}
+          envs: IMAGE_REF,GHCR_USER,GHCR_TOKEN,POSTGRES_PASSWORD,JWT_SECRET,USER_SERVICE_SECRET
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            compose_dir="/opt/roommy-stage/user-service"
+            env_file="${compose_dir}/user-service.env"
+            compose_file="${compose_dir}/docker-compose.yml"
+            legacy_env="/opt/user-service/shared/env/user-service.env"
+
+            read_legacy() {
+              key="$1"
+              if [ -f "$legacy_env" ]; then
+                sed -n "s/^${key}=//p" "$legacy_env" | head -n 1
+              fi
+            }
+
+            keep_or_secret() {
+              key="$1"
+              value="$2"
+              if [ -n "$value" ]; then
+                printf '%s' "$value"
+              else
+                read_legacy "$key"
+              fi
+            }
+
+            POSTGRES_PASSWORD="$(keep_or_secret POSTGRES_PASSWORD "${POSTGRES_PASSWORD:-}")"
+            JWT_SECRET="$(keep_or_secret JWT_SECRET "${JWT_SECRET:-}")"
+            USER_SERVICE_SECRET="$(keep_or_secret INTERNAL_TOKEN "${USER_SERVICE_SECRET:-}")"
+
+            sudo mkdir -p "$compose_dir"
+            sudo chown "$USER:$USER" "$compose_dir"
+            umask 077
+            cat > "$env_file" <<EOF
+            HTTP_ADDR=127.0.0.1:${{ env.SERVICE_PORT }}
+            POSTGRES_HOST=${{ env.POSTGRES_HOST }}
+            POSTGRES_PORT=${{ env.POSTGRES_PORT }}
+            POSTGRES_DB=${{ env.POSTGRES_DB }}
+            POSTGRES_USER=${{ env.POSTGRES_USER }}
+            POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+            POSTGRES_SSLMODE=${{ env.POSTGRES_SSLMODE }}
+            JWT_SECRET=${JWT_SECRET}
+            JWT_ISSUER=${{ env.JWT_ISSUER }}
+            JWT_AUDIENCE=${{ env.JWT_AUDIENCE }}
+            INTERNAL_TOKEN=${USER_SERVICE_SECRET}
+            EOF
+            sed -i 's/^            //' "$env_file"
+
+            cat > "$compose_file" <<EOF
+            services:
+              user-service:
+                image: ${IMAGE_REF}
+                container_name: user-service
+                network_mode: host
+                restart: unless-stopped
+                env_file:
+                  - ./user-service.env
+                labels:
+                  roommy.service: user-service
+                  roommy.environment: stage
+                  roommy.commit: ${{ github.sha }}
+            EOF
+            sed -i 's/^            //' "$compose_file"
+
+            printf '%s' "$GHCR_TOKEN" | sudo docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            sudo docker pull "$IMAGE_REF"
+            sudo docker run --rm --network host --env-file "$env_file" "$IMAGE_REF" migrate up
+            sudo systemctl disable --now user-service.service || true
+            sudo docker compose -f "$compose_file" up -d --remove-orphans
+
+            for attempt in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:${{ env.SERVICE_PORT }}/health" >/dev/null; then
+                exit 0
+              fi
+              sleep 2
+            done
+            sudo docker logs --tail=200 user-service || true
+            exit 1
+
+      - name: External healthcheck
+        run: curl -kfsS "https://${PUBLIC_BASE_HOST}/user/health"

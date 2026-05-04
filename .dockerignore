@@ -1,0 +1,8 @@
+.git
+.github
+build
+build-codex
+tests/__pycache__
+*.obj
+*.tar.gz
+*.zip
