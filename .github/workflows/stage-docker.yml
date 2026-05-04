@@ -153,7 +153,7 @@ jobs:
               sudo systemctl stop "$unit" || true
               for attempt in $(seq 1 15); do
                 if ! sudo systemctl is-active --quiet "$unit"; then
-                  sudo systemctl mask "$unit" || true
+                  sudo systemctl mask --runtime "$unit" || true
                   sudo systemctl daemon-reload || true
                   return 0
                 fi
@@ -164,7 +164,7 @@ jobs:
               sudo systemctl stop "$unit" || true
               for attempt in $(seq 1 10); do
                 if ! sudo systemctl is-active --quiet "$unit"; then
-                  sudo systemctl mask "$unit" || true
+                  sudo systemctl mask --runtime "$unit" || true
                   sudo systemctl daemon-reload || true
                   return 0
                 fi
@@ -173,7 +173,7 @@ jobs:
 
               sudo systemctl kill --kill-who=all --signal=SIGKILL "$unit" || true
               sudo systemctl stop "$unit" || true
-              sudo systemctl mask "$unit" || true
+              sudo systemctl mask --runtime "$unit" || true
               sudo systemctl daemon-reload || true
               if sudo systemctl is-active --quiet "$unit"; then
                 echo "Legacy systemd unit is still active: $unit"
