@@ -248,7 +248,6 @@ jobs:
             sudo docker pull "$IMAGE_REF"
             sudo docker run --rm --network host --env-file "$env_file" "$IMAGE_REF" migrate up
             stop_legacy_systemd "user-service.service"
-            stop_legacy_port_owner "${{ env.SERVICE_PORT }}" "user-service"
 
             container_name="user-service"
             deploy_id="${{ github.sha }}"
@@ -258,6 +257,7 @@ jobs:
               sudo docker stop "$container_name" || true
               sudo docker rename "$container_name" "$previous_container"
             fi
+            stop_legacy_port_owner "${{ env.SERVICE_PORT }}" "user-service"
             assert_port_free "${{ env.SERVICE_PORT }}"
 
 
