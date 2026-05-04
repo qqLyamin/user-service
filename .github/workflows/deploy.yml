@@ -112,7 +112,8 @@ jobs:
               "" \
               "JWT_SECRET=${{ secrets.JWT_SECRET }}" \
               "JWT_ISSUER=${{ vars.JWT_ISSUER }}" \
-              "JWT_AUDIENCE=${{ vars.JWT_AUDIENCE }}" > "$ENV_FILE"
+              "JWT_AUDIENCE=${{ vars.JWT_AUDIENCE }}" \
+              "INTERNAL_TOKEN=${{ secrets.USER_SERVICE_SECRET }}" > "$ENV_FILE"
 
             cp "$RELEASE_DIR/deploy/user-service.service" /tmp/user-service.service
             sed -i "s|__DEPLOY_USER__|${{ vars.DEPLOY_USER }}|g" /tmp/user-service.service
