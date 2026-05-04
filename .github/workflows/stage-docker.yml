@@ -18,7 +18,7 @@ env:
   DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
   DEPLOY_USER: ${{ vars.DEPLOY_USER }}
   DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
-  PUBLIC_BASE_HOST: ${{ vars.PUBLIC_BASE_HOST || 'api.roommy.online' }}
+  PUBLIC_BASE_HOST: ${{ vars.STAGE_PUBLIC_HOST || vars.PUBLIC_BASE_HOST || 'api.roommy.online' }}
   POSTGRES_HOST: ${{ vars.POSTGRES_HOST || '127.0.0.1' }}
   POSTGRES_PORT: ${{ vars.POSTGRES_PORT || '5432' }}
   POSTGRES_DB: ${{ vars.POSTGRES_DB || 'user_service' }}
