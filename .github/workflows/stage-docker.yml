@@ -144,15 +144,47 @@ jobs:
 
             stop_legacy_systemd() {
               unit="$1"
-              if sudo systemctl cat "$unit" >/dev/null 2>&1; then
-                sudo systemctl stop "$unit"
-                sudo systemctl disable "$unit" || true
-                sudo systemctl reset-failed "$unit" || true
-                if sudo systemctl is-active --quiet "$unit"; then
-                  echo "Legacy systemd unit is still active: $unit"
-                  sudo systemctl status "$unit" --no-pager || true
-                  exit 1
+              if ! sudo systemctl cat "$unit" >/dev/null 2>&1; then
+                return 0
+              fi
+
+              sudo systemctl reset-failed "$unit" || true
+              sudo systemctl disable "$unit" || true
+              sudo systemctl stop "$unit" || true
+              for attempt in $(seq 1 15); do
+                if ! sudo systemctl is-active --quiet "$unit"; then
+                  sudo systemctl mask "$unit" || true
+                  sudo systemctl daemon-reload || true
+                  return 0
                 fi
+                sleep 1
+              done
+
+              sudo systemctl kill --kill-who=all --signal=SIGTERM "$unit" || true
+              sudo systemctl stop "$unit" || true
+              for attempt in $(seq 1 10); do
+                if ! sudo systemctl is-active --quiet "$unit"; then
+                  sudo systemctl mask "$unit" || true
+                  sudo systemctl daemon-reload || true
+                  return 0
+                fi
+                sleep 1
+              done
+
+              sudo systemctl kill --kill-who=all --signal=SIGKILL "$unit" || true
+              sudo systemctl stop "$unit" || true
+              sudo systemctl mask "$unit" || true
+              sudo systemctl daemon-reload || true
+              if sudo systemctl is-active --quiet "$unit"; then
+                echo "Legacy systemd unit is still active: $unit"
+                sudo systemctl status "$unit" --no-pager || true
+                exit 1
+              fi
+              main_pid="$(sudo systemctl show "$unit" -p MainPID --value 2>/dev/null || true)"
+              if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
+                echo "Legacy systemd unit still has MainPID=${main_pid}: $unit"
+                sudo systemctl status "$unit" --no-pager || true
+                exit 1
               fi
             }
 
