@@ -142,10 +142,46 @@ jobs:
             EOF
             sed -i 's/^            //' "$env_file"
 
+            stop_legacy_systemd() {
+              unit="$1"
+              if sudo systemctl cat "$unit" >/dev/null 2>&1; then
+                sudo systemctl stop "$unit"
+                sudo systemctl disable "$unit" || true
+                sudo systemctl reset-failed "$unit" || true
+                if sudo systemctl is-active --quiet "$unit"; then
+                  echo "Legacy systemd unit is still active: $unit"
+                  sudo systemctl status "$unit" --no-pager || true
+                  exit 1
+                fi
+              fi
+            }
+
+            assert_port_free() {
+              port="$1"
+              if sudo ss -ltnp "sport = :${port}" | grep -q ":${port}"; then
+                echo "Port ${port} is still occupied before starting ${container_name}"
+                sudo ss -ltnp "sport = :${port}" || true
+                exit 1
+              fi
+            }
+
+            assert_container_current() {
+              name="$1"
+              expected_commit="$2"
+              state="$(sudo docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+              restart_count="$(sudo docker inspect -f '{{.RestartCount}}' "$name" 2>/dev/null || true)"
+              commit_label="$(sudo docker inspect -f '{{index .Config.Labels "roommy.commit"}}' "$name" 2>/dev/null || true)"
+              if [ "$state" != "running" ] || [ "$restart_count" != "0" ] || [ "$commit_label" != "$expected_commit" ]; then
+                echo "Container ${name} is not the stable deployed container"
+                sudo docker inspect -f 'status={{.State.Status}} restartCount={{.RestartCount}} commit={{index .Config.Labels "roommy.commit"}} exitCode={{.State.ExitCode}}' "$name" || true
+                sudo docker logs --tail=200 "$name" || true
+                return 1
+              fi
+            }
             printf '%s' "$GHCR_TOKEN" | sudo docker login ghcr.io -u "$GHCR_USER" --password-stdin
             sudo docker pull "$IMAGE_REF"
             sudo docker run --rm --network host --env-file "$env_file" "$IMAGE_REF" migrate up
-            sudo systemctl disable --now user-service.service || true
+            stop_legacy_systemd "user-service.service"
 
             container_name="user-service"
             deploy_id="${{ github.sha }}"
@@ -155,6 +191,8 @@ jobs:
               sudo docker stop "$container_name" || true
               sudo docker rename "$container_name" "$previous_container"
             fi
+            assert_port_free "${{ env.SERVICE_PORT }}"
+
 
             rollback_previous() {
               failed_container="${container_name}-failed-${deploy_id}-$(date +%s)"
@@ -180,6 +218,16 @@ jobs:
 
             for attempt in $(seq 1 30); do
               if curl -fsS "http://127.0.0.1:${{ env.SERVICE_PORT }}/health" >/dev/null; then
+                if ! assert_container_current "$container_name" "$deploy_id"; then
+                  rollback_previous
+                  exit 1
+                fi
+                sleep 20
+                if ! assert_container_current "$container_name" "$deploy_id"; then
+                  rollback_previous
+                  exit 1
+                fi
+                curl -fsS "http://127.0.0.1:${{ env.SERVICE_PORT }}/health" >/dev/null
                 exit 0
               fi
               sleep 2
