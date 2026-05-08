@@ -12,6 +12,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -30,6 +31,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -607,6 +609,19 @@ struct RelationshipSummary {
     bool is_blocked_by_target = false;
 };
 
+struct RelationshipAuthorizationSnapshot {
+    bool actor_exists = false;
+    bool target_exists = false;
+    bool is_friend = false;
+    bool is_blocked = false;
+    bool is_blocked_by_target = false;
+    bool has_mutual_friend = false;
+    std::string target_profile_status;
+    std::string dm_policy;
+    std::string profile_visibility;
+    std::string friend_request_policy;
+};
+
 struct AuthorizationDecision {
     bool allowed = false;
     std::string reason;
@@ -762,6 +777,7 @@ ExecResult run_command_capture(const std::string& command) {
 }
 
 std::filesystem::path write_temp_sql_file(const std::string& sql) {
+    static std::atomic<unsigned long long> counter{0};
     const auto temp_dir = std::filesystem::temp_directory_path();
     std::string stamp = now_iso8601();
     for (char& ch : stamp) {
@@ -769,7 +785,7 @@ std::filesystem::path write_temp_sql_file(const std::string& sql) {
             ch = '_';
         }
     }
-    const auto filename = "user-service-" + stamp + "-" + std::to_string(std::rand()) + ".sql";
+    const auto filename = "user-service-" + stamp + "-" + std::to_string(counter.fetch_add(1, std::memory_order_relaxed)) + ".sql";
     const auto path = temp_dir / filename;
     std::ofstream stream(path, std::ios::binary);
     if (!stream) {
@@ -1639,6 +1655,68 @@ public:
         return query_scalar(sql).has_value();
     }
 
+    RelationshipAuthorizationSnapshot relationship_authorization_snapshot(const std::string& actor_user_id, const std::string& target_user_id) const {
+        if (!enabled_) {
+            return {};
+        }
+        const std::string actor = shell_escape_single_quotes(actor_user_id);
+        const std::string target = shell_escape_single_quotes(target_user_id);
+        const std::string sql =
+            "SELECT "
+            "CASE WHEN EXISTS (SELECT 1 FROM user_profiles WHERE user_id='" + actor + "') THEN 'true' ELSE 'false' END, "
+            "CASE WHEN EXISTS (SELECT 1 FROM user_profiles WHERE user_id='" + target + "') THEN 'true' ELSE 'false' END, "
+            "CASE WHEN EXISTS ("
+            "  SELECT 1 FROM user_relationships lhs "
+            "  JOIN user_relationships rhs "
+            "    ON rhs.user_id='" + target + "' "
+            "   AND rhs.target_user_id='" + actor + "' "
+            "   AND rhs.relation_type='friend' "
+            "   AND rhs.status='accepted' "
+            "  WHERE lhs.user_id='" + actor + "' "
+            "    AND lhs.target_user_id='" + target + "' "
+            "    AND lhs.relation_type='friend' "
+            "    AND lhs.status='accepted' "
+            ") THEN 'true' ELSE 'false' END, "
+            "CASE WHEN EXISTS (SELECT 1 FROM user_blocks WHERE user_id='" + actor + "' AND target_user_id='" + target + "') THEN 'true' ELSE 'false' END, "
+            "CASE WHEN EXISTS (SELECT 1 FROM user_blocks WHERE user_id='" + target + "' AND target_user_id='" + actor + "') THEN 'true' ELSE 'false' END, "
+            "CASE WHEN EXISTS ("
+            "  SELECT 1 FROM user_relationships ua "
+            "  JOIN user_relationships ub "
+            "    ON ub.user_id='" + target + "' "
+            "   AND ub.target_user_id=ua.target_user_id "
+            "   AND ub.relation_type='friend' "
+            "   AND ub.status='accepted' "
+            "  WHERE ua.user_id='" + actor + "' "
+            "    AND ua.target_user_id NOT IN ('" + actor + "','" + target + "') "
+            "    AND ua.relation_type='friend' "
+            "    AND ua.status='accepted' "
+            ") THEN 'true' ELSE 'false' END, "
+            "COALESCE((SELECT profile_status FROM user_profiles WHERE user_id='" + target + "'),''), "
+            "COALESCE((SELECT dm_policy FROM user_privacy_settings WHERE user_id='" + target + "'),''), "
+            "COALESCE((SELECT profile_visibility FROM user_privacy_settings WHERE user_id='" + target + "'),''), "
+            "COALESCE((SELECT friend_request_policy FROM user_privacy_settings WHERE user_id='" + target + "'),'');";
+        const auto rows = query_rows(sql);
+        if (!rows.has_value() || rows->empty()) {
+            return {};
+        }
+        const auto& row = rows->front();
+        if (row.size() != 10U) {
+            throw std::runtime_error("Unexpected relationship authorization row shape");
+        }
+        return RelationshipAuthorizationSnapshot{
+            .actor_exists = row[0] == "true",
+            .target_exists = row[1] == "true",
+            .is_friend = row[2] == "true",
+            .is_blocked = row[3] == "true",
+            .is_blocked_by_target = row[4] == "true",
+            .has_mutual_friend = row[5] == "true",
+            .target_profile_status = row[6],
+            .dm_policy = row[7],
+            .profile_visibility = row[8],
+            .friend_request_policy = row[9],
+        };
+    }
+
     void create_friend_request(const std::string& actor_user_id, const std::string& target_user_id) const {
         if (!enabled_) {
             return;
@@ -1916,7 +1994,8 @@ private:
 
     std::string psql_command_prefix() const {
         const auto& cfg = *config_;
-        return "PGPASSWORD='" + shell_escape_single_quotes(cfg.password) + "' psql -X -v ON_ERROR_STOP=1 -h '" + shell_escape_single_quotes(cfg.host) +
+        const std::string connect_timeout = get_env("POSTGRES_CONNECT_TIMEOUT_SECONDS").value_or("2");
+        return "PGCONNECT_TIMEOUT='" + shell_escape_single_quotes(connect_timeout) + "' PGPASSWORD='" + shell_escape_single_quotes(cfg.password) + "' psql -X -v ON_ERROR_STOP=1 -h '" + shell_escape_single_quotes(cfg.host) +
                "' -p '" + shell_escape_single_quotes(cfg.port) + "' -U '" + shell_escape_single_quotes(cfg.user) +
                "' -d '" + shell_escape_single_quotes(cfg.name) + "' ";
     }
@@ -2098,6 +2177,20 @@ int PostgresPsqlAdapter::migrate_status(const std::string& migrations_dir) const
 class ServiceState {
 public:
     Response handle(const Request& request) {
+        if (db_.enabled()) {
+            try {
+                if (auto response = handle_db_fast_path(request)) {
+                    return *response;
+                }
+            } catch (const JsonParseError&) {
+                return invalid_json_response();
+            } catch (const HttpError& ex) {
+                return error_response(ex.status, ex.code, ex.what());
+            } catch (const std::exception& ex) {
+                return error_response(400, "bad_request", ex.what());
+            }
+        }
+
         std::lock_guard<std::mutex> guard(mutex_);
         current_request_method_ = request.method;
         current_request_path_ = request.path;
@@ -2129,6 +2222,8 @@ public:
 
 private:
     std::mutex mutex_;
+    mutable std::mutex metrics_mutex_;
+    mutable std::mutex db_cache_mutex_;
     PostgresPsqlAdapter db_;
     std::optional<std::string> jwt_issuer_ = get_env("JWT_ISSUER");
     std::optional<std::string> jwt_audience_ = get_env("JWT_AUDIENCE");
@@ -2140,6 +2235,8 @@ private:
     bool allow_legacy_user_bearer_ = parse_bool_env("ALLOW_LEGACY_USER_BEARER", false);
     int presence_green_ttl_seconds_ = parse_int_env("PRESENCE_GREEN_TTL_SECONDS", 30);
     int reminder_scan_interval_seconds_ = parse_int_env("REMINDER_SCAN_INTERVAL_SECONDS", 15);
+    int health_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_HEALTH_CACHE_TTL_SECONDS", 5);
+    int internal_profile_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_INTERNAL_PROFILE_CACHE_TTL_SECONDS", 30);
     std::unordered_map<std::string, UserProfile> profiles_;
     std::unordered_map<std::string, PrivacySettings> privacy_;
     std::unordered_map<std::string, RelationshipRecord> relationships_;
@@ -2165,6 +2262,20 @@ private:
     std::set<std::string> request_profile_log_cache_;
     long long next_reminder_scan_at_ms_ = 0;
 
+    struct TimedJsonCacheEntry {
+        JsonObject value;
+        Clock::time_point expires_at;
+    };
+
+    struct HealthCacheEntry {
+        bool ready = false;
+        std::string message;
+        Clock::time_point expires_at;
+    };
+
+    std::unordered_map<std::string, TimedJsonCacheEntry> internal_profile_cache_;
+    std::optional<HealthCacheEntry> health_cache_;
+
     void reset_request_context() {
         current_request_id_ = "-";
         current_request_method_ = "-";
@@ -2176,6 +2287,263 @@ private:
         request_authorization_decision_cache_.clear();
         request_privacy_log_cache_.clear();
         request_profile_log_cache_.clear();
+    }
+
+    std::optional<Response> handle_db_fast_path(const Request& request) {
+        if (request.method == "GET" && request.path == "/healthz") {
+            return json_response(200, JsonObject{{"status", "ok"}});
+        }
+        if (request.method == "GET" && request.path == "/health") {
+            return db_health_response();
+        }
+        if (request.method == "POST" && request.path == "/v1/users/me/presence/pulse") {
+            return fast_pulse_my_presence(request);
+        }
+        if (starts_with(request.path, "/internal/users/") && ends_with(request.path, "/profile") && request.method == "GET") {
+            return fast_internal_get_profile(request);
+        }
+        if (request.method == "POST" && request.path == "/internal/users/relationships/check") {
+            return fast_internal_relationship_check(request);
+        }
+        return std::nullopt;
+    }
+
+    Response db_health_response() {
+        const auto now = Clock::now();
+        {
+            std::lock_guard<std::mutex> guard(db_cache_mutex_);
+            if (health_cache_.has_value() && now < health_cache_->expires_at) {
+                return health_response_from_cache(*health_cache_);
+            }
+        }
+
+        HealthCacheEntry refreshed;
+        refreshed.expires_at = now + std::chrono::seconds(std::max(health_cache_ttl_seconds_, 1));
+        try {
+            refreshed.ready = db_.ready();
+        } catch (const std::exception& ex) {
+            refreshed.ready = false;
+            refreshed.message = ex.what();
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(db_cache_mutex_);
+            health_cache_ = refreshed;
+        }
+        return health_response_from_cache(refreshed);
+    }
+
+    Response health_response_from_cache(const HealthCacheEntry& cached) {
+        if (cached.ready) {
+            return json_response(200, JsonObject{{"status", "ok"}, {"ready", true}, {"storage", "postgres"}});
+        }
+        JsonObject body{{"status", "degraded"}, {"ready", false}};
+        if (!cached.message.empty()) {
+            body["message"] = cached.message;
+        }
+        return json_response(503, std::move(body));
+    }
+
+    std::optional<JsonObject> cached_internal_profile(const std::string& user_id) {
+        if (internal_profile_cache_ttl_seconds_ <= 0) {
+            return std::nullopt;
+        }
+        const auto now = Clock::now();
+        std::lock_guard<std::mutex> guard(db_cache_mutex_);
+        const auto it = internal_profile_cache_.find(user_id);
+        if (it == internal_profile_cache_.end()) {
+            return std::nullopt;
+        }
+        if (now >= it->second.expires_at) {
+            internal_profile_cache_.erase(it);
+            return std::nullopt;
+        }
+        return it->second.value;
+    }
+
+    void cache_internal_profile(const std::string& user_id, const JsonObject& profile) {
+        if (internal_profile_cache_ttl_seconds_ <= 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(db_cache_mutex_);
+        internal_profile_cache_[user_id] = TimedJsonCacheEntry{
+            .value = profile,
+            .expires_at = Clock::now() + std::chrono::seconds(std::max(internal_profile_cache_ttl_seconds_, 1)),
+        };
+    }
+
+    void invalidate_user_cache(const std::string& user_id) {
+        std::lock_guard<std::mutex> guard(db_cache_mutex_);
+        internal_profile_cache_.erase(user_id);
+        health_cache_.reset();
+    }
+
+    JsonObject internal_profile_contract_from_db_profile(const JsonObject& profile) const {
+        return JsonObject{
+            {"userId", profile.at("userId")},
+            {"displayName", profile.at("displayName")},
+            {"avatarObjectId", profile.at("avatarObjectId")},
+            {"profileStatus", profile.at("profileStatus")},
+        };
+    }
+
+    Response fast_internal_get_profile(const Request& request) {
+        require_internal_token_fast(request);
+        const auto user_id = extract_user_id_from_internal_path(request.path, "/profile");
+        if (const auto cached = cached_internal_profile(user_id)) {
+            return json_response(200, *cached);
+        }
+        const auto profile = db_.get_profile(user_id);
+        if (!profile.has_value()) {
+            return error_response(404, "not_found", "User profile not found");
+        }
+        const auto contract = internal_profile_contract_from_db_profile(*profile);
+        cache_internal_profile(user_id, contract);
+        return json_response(200, contract);
+    }
+
+    Response fast_pulse_my_presence(const Request& request) {
+        const auto actor_user_id = require_actor_user_id_fast(request);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        const std::string session_id = required_string(object, "sessionId");
+        const auto device_id = optional_string(object, "deviceId");
+        const std::string platform = optional_string(object, "platform").value_or("unknown");
+        db_.upsert_presence_session(actor_user_id, session_id, device_id, platform);
+        increment_metric("presence.pulse");
+        return json_response(200, JsonObject{
+            {"status", "ok"},
+            {"userId", actor_user_id},
+            {"sessionId", session_id},
+            {"presence", "green"},
+            {"isOnline", true},
+        });
+    }
+
+    Response fast_internal_relationship_check(const Request& request) {
+        require_internal_token_fast(request);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        const std::string actor_user_id = canonical_user_id(required_string(object, "actorUserId"));
+        const std::string target_user_id = canonical_user_id(required_string(object, "targetUserId"));
+        const std::string action = normalize_relationship_action(object);
+
+        const auto snapshot = db_.relationship_authorization_snapshot(actor_user_id, target_user_id);
+        if (!snapshot.actor_exists) {
+            throw std::runtime_error("Unknown userId: " + actor_user_id);
+        }
+        if (!snapshot.target_exists) {
+            throw std::runtime_error("Unknown userId: " + target_user_id);
+        }
+
+        bool allowed = false;
+        std::string reason;
+        if (action == "dm.start" || action == "dm.read" || action == "dm.write") {
+            if (actor_user_id == target_user_id) {
+                reason = "self_dm_not_supported";
+            } else if (snapshot.is_blocked) {
+                reason = "blocked_by_actor";
+            } else if (snapshot.is_blocked_by_target) {
+                reason = "blocked_by_target";
+            } else if (snapshot.target_profile_status != "active") {
+                reason = "target_inactive";
+            } else if (snapshot.dm_policy == "everyone" || (snapshot.dm_policy == "friends_only" && snapshot.is_friend)) {
+                allowed = true;
+            } else {
+                reason = "dm_policy_denied";
+            }
+        } else if (action == "profile.read") {
+            if (actor_user_id == target_user_id) {
+                allowed = true;
+            } else if (snapshot.is_blocked || snapshot.is_blocked_by_target) {
+                reason = "blocked";
+            } else if (snapshot.target_profile_status != "active") {
+                reason = "target_inactive";
+            } else if (snapshot.profile_visibility == "public" || (snapshot.profile_visibility == "friends_only" && snapshot.is_friend)) {
+                allowed = true;
+            } else {
+                reason = "profile_visibility_denied";
+            }
+        } else if (action == "friend.request.send") {
+            if (snapshot.is_blocked || snapshot.is_blocked_by_target) {
+                reason = "blocked";
+            } else if (snapshot.friend_request_policy == "everyone" ||
+                       (snapshot.friend_request_policy == "mutuals_only" && snapshot.has_mutual_friend)) {
+                allowed = true;
+            } else {
+                reason = "friend_request_policy_denied";
+            }
+        } else if (action == "friendship.status") {
+            allowed = snapshot.is_friend;
+            if (!allowed) {
+                reason = "not_friends";
+            }
+        } else if (action == "block.status") {
+            allowed = !(snapshot.is_blocked || snapshot.is_blocked_by_target);
+            if (!allowed) {
+                reason = snapshot.is_blocked ? "blocked_by_actor" : "blocked_by_target";
+            }
+        } else {
+            throw std::runtime_error("Unsupported action: " + action);
+        }
+
+        increment_metric("relationship.check");
+        return json_response(200, JsonObject{
+            {"allowed", allowed},
+            {"reason", reason.empty() ? Json(nullptr) : Json(reason)},
+            {"relationship", JsonObject{
+                {"isFriend", snapshot.is_friend},
+                {"isBlocked", snapshot.is_blocked},
+                {"isBlockedByTarget", snapshot.is_blocked_by_target},
+            }},
+        });
+    }
+
+    std::string require_actor_user_id_fast(const Request& request) const {
+        const auto it = request.headers.find("authorization");
+        if (it == request.headers.end()) {
+            throw HttpError(401, "unauthorized", "Missing Authorization header");
+        }
+        const std::string raw_header = trim(it->second);
+        const std::string header = to_lower(raw_header);
+        const std::string legacy_prefix = "bearer user:";
+        if (allow_legacy_user_bearer_ && header.rfind(legacy_prefix, 0) == 0) {
+            return canonical_user_id(trim(raw_header.substr(legacy_prefix.size())));
+        }
+        if (header.rfind(legacy_prefix, 0) == 0) {
+            throw HttpError(401, "unauthorized", "Legacy Bearer user tokens are disabled");
+        }
+        const std::string bearer_prefix = "bearer ";
+        if (header.rfind(bearer_prefix, 0) != 0) {
+            throw HttpError(401, "unauthorized", "Expected Authorization: Bearer <jwt>");
+        }
+        return parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_, jwt_secret_).canonical_id;
+    }
+
+    void require_internal_token_fast(const Request& request) const {
+        const auto auth_it = request.headers.find("authorization");
+        if (auth_it != request.headers.end()) {
+            const std::string raw_header = trim(auth_it->second);
+            const std::string header = to_lower(raw_header);
+            const std::string bearer_prefix = "bearer ";
+            if (header.rfind(bearer_prefix, 0) != 0 || header.rfind("bearer user:", 0) == 0) {
+                throw HttpError(401, "unauthorized", "Expected Authorization: Bearer <jwt>");
+            }
+            parse_jwt_without_signature_validation(
+                trim(raw_header.substr(bearer_prefix.size())),
+                effective_internal_jwt_issuer(),
+                effective_internal_jwt_audience(),
+                effective_internal_jwt_secret());
+            return;
+        }
+        const auto it = request.headers.find("x-internal-token");
+        if (!internal_token_.has_value() || trim(*internal_token_).empty()) {
+            throw HttpError(401, "unauthorized", "Internal token authentication is not configured");
+        }
+        const std::string expected = trim(*internal_token_);
+        if (it == request.headers.end() || trim(it->second) != expected) {
+            throw HttpError(401, "unauthorized", "Missing or invalid internal authentication");
+        }
     }
 
     std::string request_id_for(const Request& request) const {
@@ -2739,6 +3107,7 @@ private:
     }
 
     void increment_metric(const std::string& key) {
+        std::lock_guard<std::mutex> guard(metrics_mutex_);
         ++metrics_[key];
     }
 
@@ -3956,8 +4325,11 @@ private:
     Response internal_metrics(const Request& request) {
         require_internal_token(request);
         JsonObject counters;
-        for (const auto& [name, value] : metrics_) {
-            counters[name] = value;
+        {
+            std::lock_guard<std::mutex> guard(metrics_mutex_);
+            for (const auto& [name, value] : metrics_) {
+                counters[name] = value;
+            }
         }
         return json_response(200, JsonObject{{"counters", counters}});
     }
@@ -4028,6 +4400,7 @@ private:
             }
             publish_event("user.profile_created", JsonObject{{"userId", user_id}});
             increment_metric("profile.created");
+            invalidate_user_cache(user_id);
             return json_response(201, JsonObject{{"status", "created"}, {"userId", user_id}});
         }
 
@@ -4049,6 +4422,7 @@ private:
                 publish_event("user.deleted", JsonObject{{"userId", user_id}});
                 increment_metric("profile.deleted");
             }
+            invalidate_user_cache(user_id);
             return json_response(200, JsonObject{{"status", "updated"}, {"userId", user_id}});
         }
 
@@ -4400,6 +4774,7 @@ private:
             db_.patch_profile(actor_user_id, object);
             increment_metric("profile.updated");
             audit("profile.update", actor_user_id, actor_user_id);
+            invalidate_user_cache(actor_user_id);
             const auto& profile = ensure_db_profile_exists_and_load(actor_user_id, preferred_display_name);
             const auto& privacy = ensure_db_privacy_exists_and_load(actor_user_id);
             return json_response(200, profile_to_json(
@@ -4436,6 +4811,7 @@ private:
         }
         audit("profile.update", actor_user_id, actor_user_id);
         increment_metric("profile.updated");
+        invalidate_user_cache(actor_user_id);
         return json_response(200, profile_to_json(profile, require_privacy_const(actor_user_id), true, actor_user_id, "self_profile", "profile_updated", false));
     }
 
@@ -5327,6 +5703,45 @@ bool assign_ipv4_address(const std::string& host, sockaddr_in& address) {
     return inet_pton(AF_INET, normalized_host.c_str(), &address.sin_addr) == 1;
 }
 
+void configure_client_socket(SOCKET client_socket) {
+#ifdef _WIN32
+    DWORD recv_timeout_ms = 5000;
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout_ms), sizeof(recv_timeout_ms));
+#else
+    timeval recv_timeout{};
+    recv_timeout.tv_sec = 5;
+    recv_timeout.tv_usec = 0;
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+#endif
+}
+
+void close_client_socket(SOCKET client_socket) {
+    shutdown(client_socket, SD_BOTH);
+    closesocket(client_socket);
+}
+
+Response service_busy_response() {
+    Response response;
+    response.status = 503;
+    response.body = JsonObject{{"error", "service_unavailable"}, {"message", "Too many in-flight requests"}};
+    return response;
+}
+
+void handle_client_socket(SOCKET client_socket, ServiceState& state) {
+    configure_client_socket(client_socket);
+    Response response;
+    try {
+        const std::string raw_request = receive_http_request(client_socket);
+        response = state.handle(parse_request(raw_request));
+    } catch (const std::exception& ex) {
+        response.status = 400;
+        response.body = JsonObject{{"error", "bad_request"}, {"message", ex.what()}};
+    }
+    const std::string payload = build_http_response(response);
+    socket_send_all(client_socket, payload);
+    close_client_socket(client_socket);
+}
+
 int run_server(const ListenAddress& listen_address) {
 #ifdef _WIN32
     WSADATA wsa_data{};
@@ -5384,6 +5799,9 @@ int run_server(const ListenAddress& listen_address) {
 
     std::cout << "user-service listening on " << listen_address.host << ":" << listen_address.port << std::endl;
     ServiceState state;
+    std::atomic<int> in_flight_requests{0};
+    const int default_max_in_flight = static_cast<int>(std::max(16U, std::min(128U, std::thread::hardware_concurrency() * 8U)));
+    const int max_in_flight_requests = std::max(1, parse_int_env("USER_SERVICE_MAX_INFLIGHT_REQUESTS", default_max_in_flight));
 
     while (true) {
         fd_set read_set;
@@ -5413,27 +5831,25 @@ int run_server(const ListenAddress& listen_address) {
         if (client_socket == INVALID_SOCKET) {
             continue;
         }
-#ifdef _WIN32
-        DWORD recv_timeout_ms = 5000;
-        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout_ms), sizeof(recv_timeout_ms));
-#else
-        timeval recv_timeout{};
-        recv_timeout.tv_sec = 5;
-        recv_timeout.tv_usec = 0;
-        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-#endif
-        Response response;
-        try {
-            const std::string raw_request = receive_http_request(client_socket);
-            response = state.handle(parse_request(raw_request));
-        } catch (const std::exception& ex) {
-            response.status = 400;
-            response.body = JsonObject{{"error", "bad_request"}, {"message", ex.what()}};
+        const int previous_in_flight = in_flight_requests.fetch_add(1, std::memory_order_acq_rel);
+        if (previous_in_flight >= max_in_flight_requests) {
+            in_flight_requests.fetch_sub(1, std::memory_order_acq_rel);
+            const std::string payload = build_http_response(service_busy_response());
+            socket_send_all(client_socket, payload);
+            close_client_socket(client_socket);
+            continue;
         }
-        const std::string payload = build_http_response(response);
-        socket_send_all(client_socket, payload);
-        shutdown(client_socket, SD_BOTH);
-        closesocket(client_socket);
+        try {
+            std::thread([client_socket, &state, &in_flight_requests]() {
+                handle_client_socket(client_socket, state);
+                in_flight_requests.fetch_sub(1, std::memory_order_acq_rel);
+            }).detach();
+        } catch (const std::exception&) {
+            in_flight_requests.fetch_sub(1, std::memory_order_acq_rel);
+            const std::string payload = build_http_response(service_busy_response());
+            socket_send_all(client_socket, payload);
+            close_client_socket(client_socket);
+        }
     }
 }
 
