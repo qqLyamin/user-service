@@ -15,14 +15,17 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <regex>
@@ -37,6 +40,10 @@
 #include <variant>
 #include <vector>
 
+#ifdef USER_SERVICE_USE_LIBPQ
+#include <libpq-fe.h>
+#endif
+
 #ifndef _WIN32
 using SOCKET = int;
 constexpr int INVALID_SOCKET = -1;
@@ -48,6 +55,9 @@ constexpr int SD_BOTH = SHUT_RDWR;
 namespace {
 
 using Clock = std::chrono::system_clock;
+using SteadyClock = std::chrono::steady_clock;
+
+thread_local std::vector<long long> request_db_query_durations_us;
 
 std::string trim(const std::string& input) {
     std::size_t start = 0;
@@ -453,6 +463,7 @@ struct Request {
     std::unordered_map<std::string, std::string> query;
     std::unordered_map<std::string, std::string> headers;
     std::string body;
+    long long queue_wait_us = 0;
 };
 
 struct Response {
@@ -774,6 +785,17 @@ ExecResult run_command_capture(const std::string& command) {
     result.exit_code = pclose(pipe);
 #endif
     return result;
+}
+
+long long elapsed_microseconds(const SteadyClock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - start).count();
+}
+
+void record_db_query_duration(const SteadyClock::time_point start) {
+    request_db_query_durations_us.push_back(elapsed_microseconds(start));
+    if (request_db_query_durations_us.size() > 512U) {
+        request_db_query_durations_us.erase(request_db_query_durations_us.begin());
+    }
 }
 
 std::filesystem::path write_temp_sql_file(const std::string& sql) {
@@ -1992,6 +2014,162 @@ private:
     bool enabled_ = false;
     std::optional<DbConfig> config_;
 
+#ifdef USER_SERVICE_USE_LIBPQ
+    struct PqConnection {
+        explicit PqConnection(PGconn* raw) : conn(raw) {}
+        ~PqConnection() {
+            if (conn != nullptr) {
+                PQfinish(conn);
+            }
+        }
+        PGconn* conn = nullptr;
+    };
+
+    class PqLease {
+    public:
+        PqLease(const PostgresPsqlAdapter& owner, std::unique_ptr<PqConnection> connection)
+            : owner_(owner), connection_(std::move(connection)) {}
+        PqLease(const PqLease&) = delete;
+        PqLease& operator=(const PqLease&) = delete;
+        ~PqLease() {
+            if (connection_) {
+                owner_.release_libpq_connection(std::move(connection_));
+            }
+        }
+        PGconn* get() const {
+            return connection_->conn;
+        }
+
+    private:
+        const PostgresPsqlAdapter& owner_;
+        std::unique_ptr<PqConnection> connection_;
+    };
+
+    mutable std::mutex libpq_pool_mutex_;
+    mutable std::condition_variable libpq_pool_cv_;
+    mutable std::deque<std::unique_ptr<PqConnection>> libpq_pool_;
+    mutable int opened_libpq_connections_ = 0;
+    int libpq_pool_size_ = parse_int_env("POSTGRES_POOL_SIZE", 16);
+    int libpq_pool_wait_timeout_ms_ = parse_int_env("POSTGRES_POOL_WAIT_TIMEOUT_MS", 500);
+    int libpq_statement_timeout_ms_ = parse_int_env("POSTGRES_STATEMENT_TIMEOUT_MS", 0);
+
+    std::unique_ptr<PqConnection> open_libpq_connection() const {
+        const auto& cfg = *config_;
+        const std::string connect_timeout = get_env("POSTGRES_CONNECT_TIMEOUT_SECONDS").value_or("2");
+        const char* keywords[] = {"host", "port", "dbname", "user", "password", "sslmode", "connect_timeout", nullptr};
+        const char* values[] = {
+            cfg.host.c_str(),
+            cfg.port.c_str(),
+            cfg.name.c_str(),
+            cfg.user.c_str(),
+            cfg.password.c_str(),
+            cfg.sslmode.c_str(),
+            connect_timeout.c_str(),
+            nullptr,
+        };
+        PGconn* raw = PQconnectdbParams(keywords, values, 0);
+        if (raw == nullptr || PQstatus(raw) != CONNECTION_OK) {
+            std::string message = raw != nullptr ? PQerrorMessage(raw) : "PQconnectdbParams returned null";
+            if (raw != nullptr) {
+                PQfinish(raw);
+            }
+            throw std::runtime_error("libpq connect failed: " + trim(message));
+        }
+        auto connection = std::make_unique<PqConnection>(raw);
+        if (libpq_statement_timeout_ms_ > 0) {
+            const std::string sql = "SET statement_timeout = " + std::to_string(libpq_statement_timeout_ms_) + ";";
+            PGresult* result = PQexec(connection->conn, sql.c_str());
+            const auto status = result != nullptr ? PQresultStatus(result) : PGRES_FATAL_ERROR;
+            std::string message = result != nullptr ? PQresultErrorMessage(result) : "PQexec returned null";
+            if (result != nullptr) {
+                PQclear(result);
+            }
+            if (status != PGRES_COMMAND_OK) {
+                throw std::runtime_error("libpq statement_timeout setup failed: " + trim(message));
+            }
+        }
+        return connection;
+    }
+
+    std::unique_ptr<PqConnection> acquire_libpq_connection() const {
+        const int pool_size = std::max(1, libpq_pool_size_);
+        const auto deadline = SteadyClock::now() + std::chrono::milliseconds(std::max(1, libpq_pool_wait_timeout_ms_));
+        std::unique_lock<std::mutex> lock(libpq_pool_mutex_);
+        while (true) {
+            if (!libpq_pool_.empty()) {
+                auto connection = std::move(libpq_pool_.front());
+                libpq_pool_.pop_front();
+                return connection;
+            }
+            if (opened_libpq_connections_ < pool_size) {
+                ++opened_libpq_connections_;
+                lock.unlock();
+                try {
+                    return open_libpq_connection();
+                } catch (...) {
+                    lock.lock();
+                    --opened_libpq_connections_;
+                    libpq_pool_cv_.notify_one();
+                    throw;
+                }
+            }
+            if (libpq_pool_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                throw std::runtime_error("libpq pool wait timeout");
+            }
+        }
+    }
+
+    void release_libpq_connection(std::unique_ptr<PqConnection> connection) const {
+        std::lock_guard<std::mutex> lock(libpq_pool_mutex_);
+        if (connection != nullptr && connection->conn != nullptr && PQstatus(connection->conn) == CONNECTION_OK) {
+            libpq_pool_.push_back(std::move(connection));
+        } else {
+            --opened_libpq_connections_;
+        }
+        libpq_pool_cv_.notify_one();
+    }
+
+    void exec_sql_libpq(const std::string& sql) const {
+        PqLease lease(*this, acquire_libpq_connection());
+        PGresult* result = PQexec(lease.get(), sql.c_str());
+        const auto status = result != nullptr ? PQresultStatus(result) : PGRES_FATAL_ERROR;
+        std::string message = result != nullptr ? PQresultErrorMessage(result) : "PQexec returned null";
+        if (result != nullptr) {
+            PQclear(result);
+        }
+        if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
+            throw std::runtime_error("libpq exec failed: " + trim(message));
+        }
+    }
+
+    std::optional<std::vector<std::vector<std::string>>> query_rows_libpq(const std::string& sql) const {
+        PqLease lease(*this, acquire_libpq_connection());
+        PGresult* result = PQexec(lease.get(), sql.c_str());
+        const auto status = result != nullptr ? PQresultStatus(result) : PGRES_FATAL_ERROR;
+        if (status != PGRES_TUPLES_OK) {
+            std::string message = result != nullptr ? PQresultErrorMessage(result) : "PQexec returned null";
+            if (result != nullptr) {
+                PQclear(result);
+            }
+            throw std::runtime_error("libpq query failed: " + trim(message));
+        }
+        std::vector<std::vector<std::string>> rows;
+        const int row_count = PQntuples(result);
+        const int column_count = PQnfields(result);
+        rows.reserve(static_cast<std::size_t>(std::max(row_count, 0)));
+        for (int row_index = 0; row_index < row_count; ++row_index) {
+            std::vector<std::string> columns;
+            columns.reserve(static_cast<std::size_t>(std::max(column_count, 0)));
+            for (int column_index = 0; column_index < column_count; ++column_index) {
+                columns.emplace_back(PQgetisnull(result, row_index, column_index) == 1 ? "" : PQgetvalue(result, row_index, column_index));
+            }
+            rows.push_back(std::move(columns));
+        }
+        PQclear(result);
+        return rows;
+    }
+#endif
+
     std::string psql_command_prefix() const {
         const auto& cfg = *config_;
         const std::string connect_timeout = get_env("POSTGRES_CONNECT_TIMEOUT_SECONDS").value_or("2");
@@ -2001,12 +2179,23 @@ private:
     }
 
     void exec_sql(const std::string& sql) const {
+        const auto db_start = SteadyClock::now();
+        try {
+#ifdef USER_SERVICE_USE_LIBPQ
+            exec_sql_libpq(sql);
+#else
         const auto temp_file = write_temp_sql_file(sql);
         const auto result = run_command_capture(psql_command_prefix() + "-q -f '" + shell_escape_single_quotes(temp_file.string()) + "' 2>&1");
         std::error_code ec;
         std::filesystem::remove(temp_file, ec);
         if (result.exit_code != 0) {
             throw std::runtime_error("psql exec failed: " + result.output);
+        }
+#endif
+            record_db_query_duration(db_start);
+        } catch (...) {
+            record_db_query_duration(db_start);
+            throw;
         }
     }
 
@@ -2019,6 +2208,13 @@ private:
     }
 
     std::optional<std::vector<std::vector<std::string>>> query_rows(const std::string& sql) const {
+        const auto db_start = SteadyClock::now();
+        try {
+#ifdef USER_SERVICE_USE_LIBPQ
+            auto rows = query_rows_libpq(sql);
+            record_db_query_duration(db_start);
+            return rows;
+#else
         const auto temp_file = write_temp_sql_file(sql);
         const auto result = run_command_capture(psql_command_prefix() + "-At -F '|' -f '" + shell_escape_single_quotes(temp_file.string()) + "' 2>&1");
         std::error_code ec;
@@ -2047,7 +2243,13 @@ private:
             }
             rows.push_back(columns);
         }
+        record_db_query_duration(db_start);
         return rows;
+#endif
+        } catch (...) {
+            record_db_query_duration(db_start);
+            throw;
+        }
     }
 
     std::optional<ReminderRecord> find_scheduled_reminder(
@@ -2177,53 +2379,70 @@ int PostgresPsqlAdapter::migrate_status(const std::string& migrations_dir) const
 class ServiceState {
 public:
     Response handle(const Request& request) {
-        if (db_.enabled()) {
-            try {
-                if (auto response = handle_db_fast_path(request)) {
-                    return *response;
+        const std::string route_key = route_metric_key(request);
+        const auto request_start = SteadyClock::now();
+        request_db_query_durations_us.clear();
+        record_route_start(route_key);
+
+        Response response;
+        try {
+            if (db_.enabled()) {
+                if (auto fast_response = handle_db_fast_path(request)) {
+                    const auto db_durations = request_db_query_durations_us;
+                    record_route_finish(route_key, fast_response->status, elapsed_microseconds(request_start), request.queue_wait_us, db_durations);
+                    request_db_query_durations_us.clear();
+                    return *fast_response;
                 }
-            } catch (const JsonParseError&) {
-                return invalid_json_response();
-            } catch (const HttpError& ex) {
-                return error_response(ex.status, ex.code, ex.what());
-            } catch (const std::exception& ex) {
-                return error_response(400, "bad_request", ex.what());
             }
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                current_request_method_ = request.method;
+                current_request_path_ = request.path;
+                current_request_id_ = request_id_for(request);
+                current_jwt_principal_.reset();
+                try {
+                    response = route(request);
+                } catch (const JsonParseError&) {
+                    response = invalid_json_response();
+                } catch (const HttpError& ex) {
+                    response = error_response(ex.status, ex.code, ex.what());
+                } catch (const std::exception& ex) {
+                    response = error_response(400, "bad_request", ex.what());
+                }
+                reset_request_context();
+            }
+        } catch (const JsonParseError&) {
+            response = invalid_json_response();
+        } catch (const HttpError& ex) {
+            response = error_response(ex.status, ex.code, ex.what());
+        } catch (const std::exception& ex) {
+            response = error_response(400, "bad_request", ex.what());
         }
 
-        std::lock_guard<std::mutex> guard(mutex_);
-        current_request_method_ = request.method;
-        current_request_path_ = request.path;
-        current_request_id_ = request_id_for(request);
-        current_jwt_principal_.reset();
-        try {
-            auto response = route(request);
-            reset_request_context();
-            return response;
-        } catch (const JsonParseError&) {
-            auto response = invalid_json_response();
-            reset_request_context();
-            return response;
-        } catch (const HttpError& ex) {
-            auto response = error_response(ex.status, ex.code, ex.what());
-            reset_request_context();
-            return response;
-        } catch (const std::exception& ex) {
-            auto response = error_response(400, "bad_request", ex.what());
-            reset_request_context();
-            return response;
-        }
+        const auto db_durations = request_db_query_durations_us;
+        record_route_finish(route_key, response.status, elapsed_microseconds(request_start), request.queue_wait_us, db_durations);
+        request_db_query_durations_us.clear();
+        return response;
     }
 
     void run_background_jobs() {
+        flush_debounced_presence_writes();
         std::lock_guard<std::mutex> guard(mutex_);
         run_background_jobs_locked();
+    }
+
+    void record_bulkhead_rejection() {
+        std::lock_guard<std::mutex> guard(metrics_mutex_);
+        auto& route = route_metrics_["__bulkhead__"];
+        ++route.rejected_by_bulkhead;
+        ++route.errors;
     }
 
 private:
     std::mutex mutex_;
     mutable std::mutex metrics_mutex_;
     mutable std::mutex db_cache_mutex_;
+    mutable std::mutex presence_cache_mutex_;
     PostgresPsqlAdapter db_;
     std::optional<std::string> jwt_issuer_ = get_env("JWT_ISSUER");
     std::optional<std::string> jwt_audience_ = get_env("JWT_AUDIENCE");
@@ -2237,6 +2456,9 @@ private:
     int reminder_scan_interval_seconds_ = parse_int_env("REMINDER_SCAN_INTERVAL_SECONDS", 15);
     int health_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_HEALTH_CACHE_TTL_SECONDS", 5);
     int internal_profile_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_INTERNAL_PROFILE_CACHE_TTL_SECONDS", 30);
+    int presence_db_debounce_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_DB_DEBOUNCE_SECONDS", 20);
+    int presence_ttl_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_TTL_SECONDS", 60);
+    int presence_flush_interval_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_FLUSH_INTERVAL_SECONDS", 5);
     std::unordered_map<std::string, UserProfile> profiles_;
     std::unordered_map<std::string, PrivacySettings> privacy_;
     std::unordered_map<std::string, RelationshipRecord> relationships_;
@@ -2273,8 +2495,33 @@ private:
         Clock::time_point expires_at;
     };
 
+    struct PendingPresenceWrite {
+        std::string user_id;
+        std::string session_id;
+        std::optional<std::string> device_id;
+        std::string platform;
+        Clock::time_point last_db_write_at;
+        Clock::time_point expires_at;
+        bool dirty = false;
+    };
+
+    struct RouteMetricRecord {
+        long long total = 0;
+        long long errors = 0;
+        long long rejected_by_bulkhead = 0;
+        long long cache_hits = 0;
+        long long cache_misses = 0;
+        int in_flight = 0;
+        std::vector<long long> latency_us_samples;
+        std::vector<long long> queue_wait_us_samples;
+        std::vector<long long> db_query_us_samples;
+    };
+
     std::unordered_map<std::string, TimedJsonCacheEntry> internal_profile_cache_;
+    std::unordered_map<std::string, PendingPresenceWrite> pending_presence_writes_;
+    std::unordered_map<std::string, RouteMetricRecord> route_metrics_;
     std::optional<HealthCacheEntry> health_cache_;
+    Clock::time_point next_presence_flush_at_ = Clock::now();
 
     void reset_request_context() {
         current_request_id_ = "-";
@@ -2287,6 +2534,98 @@ private:
         request_authorization_decision_cache_.clear();
         request_privacy_log_cache_.clear();
         request_profile_log_cache_.clear();
+    }
+
+    static void push_metric_sample(std::vector<long long>& samples, const long long value) {
+        constexpr std::size_t max_samples = 512;
+        samples.push_back(value);
+        if (samples.size() > max_samples) {
+            samples.erase(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(samples.size() - max_samples));
+        }
+    }
+
+    static double percentile_ms(std::vector<long long> samples, const double percentile) {
+        if (samples.empty()) {
+            return 0.0;
+        }
+        std::sort(samples.begin(), samples.end());
+        const std::size_t index = static_cast<std::size_t>(
+            std::min<double>(static_cast<double>(samples.size() - 1), std::max(0.0, percentile * static_cast<double>(samples.size() - 1))));
+        return static_cast<double>(samples[index]) / 1000.0;
+    }
+
+    std::string route_metric_key(const Request& request) const {
+        if (request.path == "/health" || request.path == "/healthz") {
+            return request.method + " " + request.path;
+        }
+        if (request.path == "/internal/users/batch") {
+            return request.method + " /internal/users/batch";
+        }
+        if (request.path == "/internal/users/relationships/check") {
+            return request.method + " /internal/users/relationships/check";
+        }
+        if (starts_with(request.path, "/internal/users/") && ends_with(request.path, "/profile")) {
+            return request.method + " /internal/users/{userId}/profile";
+        }
+        if (starts_with(request.path, "/internal/users/") && ends_with(request.path, "/authorize-profile-read")) {
+            return request.method + " /internal/users/{userId}/authorize-profile-read";
+        }
+        if (request.path == "/v1/users/me/presence/pulse" ||
+            request.path == "/v1/users/me/presence/disconnect" ||
+            request.path == "/v1/users/presence/query") {
+            return request.method + " " + request.path;
+        }
+        if (starts_with(request.path, "/v1/users/") && ends_with(request.path, "/friend-request")) {
+            return request.method + " /v1/users/{userId}/friend-request";
+        }
+        if (starts_with(request.path, "/v1/users/") && ends_with(request.path, "/friend-request/accept")) {
+            return request.method + " /v1/users/{userId}/friend-request/accept";
+        }
+        if (starts_with(request.path, "/v1/users/") && ends_with(request.path, "/friend-request/decline")) {
+            return request.method + " /v1/users/{userId}/friend-request/decline";
+        }
+        if (starts_with(request.path, "/v1/users/") && ends_with(request.path, "/friend")) {
+            return request.method + " /v1/users/{userId}/friend";
+        }
+        if (starts_with(request.path, "/v1/users/") && ends_with(request.path, "/block")) {
+            return request.method + " /v1/users/{userId}/block";
+        }
+        return request.method + " " + request.path;
+    }
+
+    void record_route_start(const std::string& route) {
+        std::lock_guard<std::mutex> guard(metrics_mutex_);
+        ++route_metrics_[route].in_flight;
+    }
+
+    void record_route_finish(
+        const std::string& route,
+        const int status,
+        const long long latency_us,
+        const long long queue_wait_us,
+        const std::vector<long long>& db_query_durations_us) {
+        std::lock_guard<std::mutex> guard(metrics_mutex_);
+        auto& metrics = route_metrics_[route];
+        metrics.in_flight = std::max(0, metrics.in_flight - 1);
+        ++metrics.total;
+        if (status >= 500) {
+            ++metrics.errors;
+        }
+        push_metric_sample(metrics.latency_us_samples, latency_us);
+        push_metric_sample(metrics.queue_wait_us_samples, queue_wait_us);
+        for (const auto duration_us : db_query_durations_us) {
+            push_metric_sample(metrics.db_query_us_samples, duration_us);
+        }
+    }
+
+    void record_route_cache_result(const std::string& route, const bool hit) {
+        std::lock_guard<std::mutex> guard(metrics_mutex_);
+        auto& metrics = route_metrics_[route];
+        if (hit) {
+            ++metrics.cache_hits;
+        } else {
+            ++metrics.cache_misses;
+        }
     }
 
     std::optional<Response> handle_db_fast_path(const Request& request) {
@@ -2313,9 +2652,11 @@ private:
         {
             std::lock_guard<std::mutex> guard(db_cache_mutex_);
             if (health_cache_.has_value() && now < health_cache_->expires_at) {
+                record_route_cache_result("GET /health", true);
                 return health_response_from_cache(*health_cache_);
             }
         }
+        record_route_cache_result("GET /health", false);
 
         HealthCacheEntry refreshed;
         refreshed.expires_at = now + std::chrono::seconds(std::max(health_cache_ttl_seconds_, 1));
@@ -2391,8 +2732,10 @@ private:
         require_internal_token_fast(request);
         const auto user_id = extract_user_id_from_internal_path(request.path, "/profile");
         if (const auto cached = cached_internal_profile(user_id)) {
+            record_route_cache_result("GET /internal/users/{userId}/profile", true);
             return json_response(200, *cached);
         }
+        record_route_cache_result("GET /internal/users/{userId}/profile", false);
         const auto profile = db_.get_profile(user_id);
         if (!profile.has_value()) {
             return error_response(404, "not_found", "User profile not found");
@@ -2409,7 +2752,12 @@ private:
         const std::string session_id = required_string(object, "sessionId");
         const auto device_id = optional_string(object, "deviceId");
         const std::string platform = optional_string(object, "platform").value_or("unknown");
-        db_.upsert_presence_session(actor_user_id, session_id, device_id, platform);
+        const bool write_now = should_write_presence_to_db(actor_user_id, session_id, device_id, platform);
+        record_route_cache_result("POST /v1/users/me/presence/pulse", !write_now);
+        if (write_now) {
+            db_.upsert_presence_session(actor_user_id, session_id, device_id, platform);
+            mark_presence_written(actor_user_id, session_id);
+        }
         increment_metric("presence.pulse");
         return json_response(200, JsonObject{
             {"status", "ok"},
@@ -2418,6 +2766,89 @@ private:
             {"presence", "green"},
             {"isOnline", true},
         });
+    }
+
+    bool should_write_presence_to_db(
+        const std::string& user_id,
+        const std::string& session_id,
+        const std::optional<std::string>& device_id,
+        const std::string& platform) {
+        if (presence_db_debounce_seconds_ <= 0) {
+            return true;
+        }
+        const auto now = Clock::now();
+        const auto key = pair_key(user_id, session_id);
+        std::lock_guard<std::mutex> guard(presence_cache_mutex_);
+        auto& entry = pending_presence_writes_[key];
+        const bool is_new = entry.user_id.empty();
+        if (is_new) {
+            entry.user_id = user_id;
+            entry.session_id = session_id;
+            entry.last_db_write_at = Clock::time_point{};
+        }
+        entry.device_id = device_id;
+        entry.platform = platform;
+        entry.expires_at = now + std::chrono::seconds(std::max(presence_ttl_seconds_, 1));
+        const bool due = entry.last_db_write_at == Clock::time_point{} ||
+            now - entry.last_db_write_at >= std::chrono::seconds(std::max(presence_db_debounce_seconds_, 1));
+        entry.dirty = !due;
+        return due;
+    }
+
+    void mark_presence_written(const std::string& user_id, const std::string& session_id) {
+        const auto key = pair_key(user_id, session_id);
+        std::lock_guard<std::mutex> guard(presence_cache_mutex_);
+        const auto it = pending_presence_writes_.find(key);
+        if (it == pending_presence_writes_.end()) {
+            return;
+        }
+        it->second.last_db_write_at = Clock::now();
+        it->second.dirty = false;
+    }
+
+    void remove_pending_presence_write(const std::string& user_id, const std::string& session_id) {
+        std::lock_guard<std::mutex> guard(presence_cache_mutex_);
+        pending_presence_writes_.erase(pair_key(user_id, session_id));
+    }
+
+    void flush_debounced_presence_writes() {
+        if (!db_.enabled() || presence_db_debounce_seconds_ <= 0) {
+            return;
+        }
+        const auto now = Clock::now();
+        std::vector<PendingPresenceWrite> due_writes;
+        {
+            std::lock_guard<std::mutex> guard(presence_cache_mutex_);
+            if (now < next_presence_flush_at_) {
+                return;
+            }
+            next_presence_flush_at_ = now + std::chrono::seconds(std::max(presence_flush_interval_seconds_, 1));
+            for (auto it = pending_presence_writes_.begin(); it != pending_presence_writes_.end();) {
+                if (now >= it->second.expires_at) {
+                    it = pending_presence_writes_.erase(it);
+                    continue;
+                }
+                const bool due = it->second.dirty && (
+                    it->second.last_db_write_at == Clock::time_point{} ||
+                    now - it->second.last_db_write_at >= std::chrono::seconds(std::max(presence_db_debounce_seconds_, 1)));
+                if (due) {
+                    due_writes.push_back(it->second);
+                }
+                ++it;
+            }
+        }
+        for (const auto& write : due_writes) {
+            try {
+                db_.upsert_presence_session(write.user_id, write.session_id, write.device_id, write.platform);
+                mark_presence_written(write.user_id, write.session_id);
+                increment_metric("presence.flush");
+            } catch (const std::exception& ex) {
+                std::cerr << "presence flush failed userId=" << sanitize_log_value(write.user_id)
+                          << " sessionId=" << sanitize_log_value(write.session_id)
+                          << " error=" << sanitize_log_value(ex.what()) << std::endl;
+            }
+        }
+        request_db_query_durations_us.clear();
     }
 
     Response fast_internal_relationship_check(const Request& request) {
@@ -4325,13 +4756,27 @@ private:
     Response internal_metrics(const Request& request) {
         require_internal_token(request);
         JsonObject counters;
+        JsonObject routes;
         {
             std::lock_guard<std::mutex> guard(metrics_mutex_);
             for (const auto& [name, value] : metrics_) {
                 counters[name] = value;
             }
+            for (const auto& [name, value] : route_metrics_) {
+                routes[name] = JsonObject{
+                    {"total", json_int64(value.total)},
+                    {"errors", json_int64(value.errors)},
+                    {"inFlight", value.in_flight},
+                    {"rejectedByBulkhead", json_int64(value.rejected_by_bulkhead)},
+                    {"cacheHits", json_int64(value.cache_hits)},
+                    {"cacheMisses", json_int64(value.cache_misses)},
+                    {"latencyP95Ms", percentile_ms(value.latency_us_samples, 0.95)},
+                    {"queueWaitP95Ms", percentile_ms(value.queue_wait_us_samples, 0.95)},
+                    {"dbQueryP95Ms", percentile_ms(value.db_query_us_samples, 0.95)},
+                };
+            }
         }
-        return json_response(200, JsonObject{{"counters", counters}});
+        return json_response(200, JsonObject{{"counters", counters}, {"routes", routes}});
     }
 
     Response internal_outbox(const Request& request) {
@@ -5157,6 +5602,9 @@ private:
         if (!updated) {
             return error_response(404, "not_found", "Presence session not found");
         }
+        if (db_.enabled()) {
+            remove_pending_presence_write(actor_user_id, session_id);
+        }
         increment_metric("presence.disconnect");
         return json_response(200, JsonObject{
             {"status", "ok"},
@@ -5727,12 +6175,14 @@ Response service_busy_response() {
     return response;
 }
 
-void handle_client_socket(SOCKET client_socket, ServiceState& state) {
+void handle_client_socket(SOCKET client_socket, ServiceState& state, const SteadyClock::time_point accepted_at) {
     configure_client_socket(client_socket);
     Response response;
     try {
         const std::string raw_request = receive_http_request(client_socket);
-        response = state.handle(parse_request(raw_request));
+        Request request = parse_request(raw_request);
+        request.queue_wait_us = elapsed_microseconds(accepted_at);
+        response = state.handle(request);
     } catch (const std::exception& ex) {
         response.status = 400;
         response.body = JsonObject{{"error", "bad_request"}, {"message", ex.what()}};
@@ -5831,17 +6281,19 @@ int run_server(const ListenAddress& listen_address) {
         if (client_socket == INVALID_SOCKET) {
             continue;
         }
+        const auto accepted_at = SteadyClock::now();
         const int previous_in_flight = in_flight_requests.fetch_add(1, std::memory_order_acq_rel);
         if (previous_in_flight >= max_in_flight_requests) {
             in_flight_requests.fetch_sub(1, std::memory_order_acq_rel);
+            state.record_bulkhead_rejection();
             const std::string payload = build_http_response(service_busy_response());
             socket_send_all(client_socket, payload);
             close_client_socket(client_socket);
             continue;
         }
         try {
-            std::thread([client_socket, &state, &in_flight_requests]() {
-                handle_client_socket(client_socket, state);
+            std::thread([client_socket, &state, &in_flight_requests, accepted_at]() {
+                handle_client_socket(client_socket, state, accepted_at);
                 in_flight_requests.fetch_sub(1, std::memory_order_acq_rel);
             }).detach();
         } catch (const std::exception&) {
