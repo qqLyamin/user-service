@@ -2382,7 +2382,10 @@ public:
         const std::string route_key = route_metric_key(request);
         const auto request_start = SteadyClock::now();
         request_db_query_durations_us.clear();
-        record_route_start(route_key);
+        if (!try_acquire_route(route_key)) {
+            request_db_query_durations_us.clear();
+            return json_response(503, JsonObject{{"error", "service_unavailable"}, {"message", "Too many in-flight requests"}});
+        }
 
         Response response;
         try {
@@ -2431,9 +2434,10 @@ public:
         run_background_jobs_locked();
     }
 
-    void record_bulkhead_rejection() {
+    void record_connection_bulkhead_rejection() {
         std::lock_guard<std::mutex> guard(metrics_mutex_);
-        auto& route = route_metrics_["__bulkhead__"];
+        auto& route = route_metrics_["__connection_bulkhead__"];
+        ++route.total;
         ++route.rejected_by_bulkhead;
         ++route.errors;
     }
@@ -2452,10 +2456,18 @@ private:
     std::optional<std::string> internal_jwt_secret_ = get_env("INTERNAL_JWT_SECRET");
     std::optional<std::string> internal_token_ = get_env("INTERNAL_TOKEN");
     bool allow_legacy_user_bearer_ = parse_bool_env("ALLOW_LEGACY_USER_BEARER", false);
+    int route_default_inflight_limit_ = parse_int_env("USER_SERVICE_ROUTE_DEFAULT_INFLIGHT", 512);
+    int route_me_inflight_limit_ = parse_int_env("USER_SERVICE_ROUTE_ME_INFLIGHT", 1024);
+    int route_presence_pulse_inflight_limit_ = parse_int_env("USER_SERVICE_ROUTE_PRESENCE_PULSE_INFLIGHT", 4096);
+    int route_presence_query_inflight_limit_ = parse_int_env("USER_SERVICE_ROUTE_PRESENCE_QUERY_INFLIGHT", 1024);
+    int route_internal_profile_inflight_limit_ = parse_int_env("USER_SERVICE_ROUTE_INTERNAL_PROFILE_INFLIGHT", 2048);
+    int route_relationship_check_inflight_limit_ = parse_int_env("USER_SERVICE_ROUTE_RELATIONSHIP_CHECK_INFLIGHT", 1024);
     int presence_green_ttl_seconds_ = parse_int_env("PRESENCE_GREEN_TTL_SECONDS", 30);
     int reminder_scan_interval_seconds_ = parse_int_env("REMINDER_SCAN_INTERVAL_SECONDS", 15);
     int health_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_HEALTH_CACHE_TTL_SECONDS", 5);
+    int me_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_ME_CACHE_TTL_SECONDS", 10);
     int internal_profile_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_INTERNAL_PROFILE_CACHE_TTL_SECONDS", 30);
+    bool presence_async_db_flush_ = parse_bool_env("USER_SERVICE_PRESENCE_ASYNC_DB_FLUSH", true);
     int presence_db_debounce_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_DB_DEBOUNCE_SECONDS", 20);
     int presence_ttl_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_TTL_SECONDS", 60);
     int presence_flush_interval_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_FLUSH_INTERVAL_SECONDS", 5);
@@ -2495,6 +2507,11 @@ private:
         Clock::time_point expires_at;
     };
 
+    struct CachedMeEntry {
+        JsonObject response;
+        Clock::time_point expires_at;
+    };
+
     struct PendingPresenceWrite {
         std::string user_id;
         std::string session_id;
@@ -2518,6 +2535,7 @@ private:
     };
 
     std::unordered_map<std::string, TimedJsonCacheEntry> internal_profile_cache_;
+    std::unordered_map<std::string, CachedMeEntry> me_cache_;
     std::unordered_map<std::string, PendingPresenceWrite> pending_presence_writes_;
     std::unordered_map<std::string, RouteMetricRecord> route_metrics_;
     std::optional<HealthCacheEntry> health_cache_;
@@ -2593,9 +2611,40 @@ private:
         return request.method + " " + request.path;
     }
 
-    void record_route_start(const std::string& route) {
+    int route_inflight_limit(const std::string& route) const {
+        if (route == "GET /health" || route == "GET /healthz") {
+            return 0;
+        }
+        if (route == "GET /v1/users/me") {
+            return route_me_inflight_limit_;
+        }
+        if (route == "POST /v1/users/me/presence/pulse") {
+            return route_presence_pulse_inflight_limit_;
+        }
+        if (route == "POST /v1/users/presence/query") {
+            return route_presence_query_inflight_limit_;
+        }
+        if (route == "GET /internal/users/{userId}/profile") {
+            return route_internal_profile_inflight_limit_;
+        }
+        if (route == "POST /internal/users/relationships/check") {
+            return route_relationship_check_inflight_limit_;
+        }
+        return route_default_inflight_limit_;
+    }
+
+    bool try_acquire_route(const std::string& route) {
         std::lock_guard<std::mutex> guard(metrics_mutex_);
-        ++route_metrics_[route].in_flight;
+        auto& metrics = route_metrics_[route];
+        const int limit = route_inflight_limit(route);
+        if (limit > 0 && metrics.in_flight >= limit) {
+            ++metrics.total;
+            ++metrics.errors;
+            ++metrics.rejected_by_bulkhead;
+            return false;
+        }
+        ++metrics.in_flight;
+        return true;
     }
 
     void record_route_finish(
@@ -2635,8 +2684,14 @@ private:
         if (request.method == "GET" && request.path == "/health") {
             return db_health_response();
         }
+        if (request.method == "GET" && request.path == "/v1/users/me") {
+            return fast_get_me(request);
+        }
         if (request.method == "POST" && request.path == "/v1/users/me/presence/pulse") {
             return fast_pulse_my_presence(request);
+        }
+        if (request.method == "POST" && request.path == "/v1/users/presence/query") {
+            return fast_query_presence(request);
         }
         if (starts_with(request.path, "/internal/users/") && ends_with(request.path, "/profile") && request.method == "GET") {
             return fast_internal_get_profile(request);
@@ -2713,9 +2768,38 @@ private:
         };
     }
 
+    std::optional<JsonObject> cached_me_response(const std::string& user_id) {
+        if (me_cache_ttl_seconds_ <= 0) {
+            return std::nullopt;
+        }
+        const auto now = Clock::now();
+        std::lock_guard<std::mutex> guard(db_cache_mutex_);
+        const auto it = me_cache_.find(user_id);
+        if (it == me_cache_.end()) {
+            return std::nullopt;
+        }
+        if (now >= it->second.expires_at) {
+            me_cache_.erase(it);
+            return std::nullopt;
+        }
+        return it->second.response;
+    }
+
+    void cache_me_response(const std::string& user_id, const JsonObject& response) {
+        if (me_cache_ttl_seconds_ <= 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(db_cache_mutex_);
+        me_cache_[user_id] = CachedMeEntry{
+            .response = response,
+            .expires_at = Clock::now() + std::chrono::seconds(std::max(me_cache_ttl_seconds_, 1)),
+        };
+    }
+
     void invalidate_user_cache(const std::string& user_id) {
         std::lock_guard<std::mutex> guard(db_cache_mutex_);
         internal_profile_cache_.erase(user_id);
+        me_cache_.erase(user_id);
         health_cache_.reset();
     }
 
@@ -2726,6 +2810,27 @@ private:
             {"avatarObjectId", profile.at("avatarObjectId")},
             {"profileStatus", profile.at("profileStatus")},
         };
+    }
+
+    Response fast_get_me(const Request& request) {
+        const auto actor_user_id = require_actor_user_id_fast(request);
+        if (const auto cached = cached_me_response(actor_user_id)) {
+            record_route_cache_result("GET /v1/users/me", true);
+            increment_metric("profile.read.self");
+            return json_response(200, *cached);
+        }
+        record_route_cache_result("GET /v1/users/me", false);
+        auto profile = db_.get_profile(actor_user_id);
+        if (!profile.has_value()) {
+            db_.ensure_profile_exists(actor_user_id, "User " + actor_user_id.substr(0, std::min<std::size_t>(8, actor_user_id.size())));
+            profile = db_.get_profile(actor_user_id);
+        }
+        if (!profile.has_value()) {
+            throw std::runtime_error("Failed to load DB profile after ensure");
+        }
+        cache_me_response(actor_user_id, *profile);
+        increment_metric("profile.read.self");
+        return json_response(200, *profile);
     }
 
     Response fast_internal_get_profile(const Request& request) {
@@ -2768,6 +2873,59 @@ private:
         });
     }
 
+    Response fast_query_presence(const Request& request) {
+        require_actor_user_id_fast(request);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        auto requested_user_ids = required_string_array(object, "userIds");
+        if (requested_user_ids.size() > 200U) {
+            return error_response(400, "bad_request", "userIds supports at most 200 items");
+        }
+        std::vector<std::string> normalized_user_ids;
+        std::set<std::string> seen;
+        for (const auto& raw_user_id : requested_user_ids) {
+            const auto user_id = canonical_user_id(raw_user_id);
+            if (seen.insert(user_id).second) {
+                normalized_user_ids.push_back(user_id);
+            }
+        }
+
+        const auto snapshots = db_.list_presence(normalized_user_ids, presence_green_ttl_seconds_);
+        std::unordered_map<std::string, PresenceSnapshot> by_user_id;
+        for (const auto& snapshot : snapshots) {
+            by_user_id[snapshot.user_id] = snapshot;
+        }
+        overlay_pending_presence(by_user_id);
+
+        JsonArray items;
+        for (const auto& user_id : normalized_user_ids) {
+            const auto it = by_user_id.find(user_id);
+            if (it != by_user_id.end()) {
+                items.emplace_back(presence_to_json(it->second));
+            } else {
+                items.emplace_back(presence_to_json(PresenceSnapshot{.user_id = user_id}));
+            }
+        }
+        increment_metric("presence.query");
+        return json_response(200, JsonObject{{"items", items}});
+    }
+
+    void overlay_pending_presence(std::unordered_map<std::string, PresenceSnapshot>& by_user_id) const {
+        const auto now = Clock::now();
+        std::lock_guard<std::mutex> guard(presence_cache_mutex_);
+        for (const auto& [key, session] : pending_presence_writes_) {
+            if (now >= session.expires_at) {
+                continue;
+            }
+            auto& snapshot = by_user_id[session.user_id];
+            snapshot.user_id = session.user_id;
+            snapshot.presence = "green";
+            snapshot.is_online = true;
+            snapshot.connected_session_count = std::max(snapshot.connected_session_count, 0) + 1;
+            snapshot.recent_session_count = std::max(snapshot.recent_session_count, 0) + 1;
+        }
+    }
+
     bool should_write_presence_to_db(
         const std::string& user_id,
         const std::string& session_id,
@@ -2791,6 +2949,10 @@ private:
         entry.expires_at = now + std::chrono::seconds(std::max(presence_ttl_seconds_, 1));
         const bool due = entry.last_db_write_at == Clock::time_point{} ||
             now - entry.last_db_write_at >= std::chrono::seconds(std::max(presence_db_debounce_seconds_, 1));
+        if (presence_async_db_flush_) {
+            entry.dirty = true;
+            return false;
+        }
         entry.dirty = !due;
         return due;
     }
@@ -6250,8 +6412,8 @@ int run_server(const ListenAddress& listen_address) {
     std::cout << "user-service listening on " << listen_address.host << ":" << listen_address.port << std::endl;
     ServiceState state;
     std::atomic<int> in_flight_requests{0};
-    const int default_max_in_flight = static_cast<int>(std::max(16U, std::min(128U, std::thread::hardware_concurrency() * 8U)));
-    const int max_in_flight_requests = std::max(1, parse_int_env("USER_SERVICE_MAX_INFLIGHT_REQUESTS", default_max_in_flight));
+    const int default_connection_limit = static_cast<int>(std::max(512U, std::min(4096U, std::thread::hardware_concurrency() * 256U)));
+    const int max_connection_threads = std::max(1, parse_int_env("USER_SERVICE_CONNECTION_THREAD_LIMIT", default_connection_limit));
 
     while (true) {
         fd_set read_set;
@@ -6283,9 +6445,9 @@ int run_server(const ListenAddress& listen_address) {
         }
         const auto accepted_at = SteadyClock::now();
         const int previous_in_flight = in_flight_requests.fetch_add(1, std::memory_order_acq_rel);
-        if (previous_in_flight >= max_in_flight_requests) {
+        if (previous_in_flight >= max_connection_threads) {
             in_flight_requests.fetch_sub(1, std::memory_order_acq_rel);
-            state.record_bulkhead_rejection();
+            state.record_connection_bulkhead_rejection();
             const std::string payload = build_http_response(service_busy_response());
             socket_send_all(client_socket, payload);
             close_client_socket(client_socket);
