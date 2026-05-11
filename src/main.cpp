@@ -2033,16 +2033,20 @@ private:
         PqLease& operator=(const PqLease&) = delete;
         ~PqLease() {
             if (connection_) {
-                owner_.release_libpq_connection(std::move(connection_));
+                owner_.release_libpq_connection(std::move(connection_), reusable_);
             }
         }
         PGconn* get() const {
             return connection_->conn;
         }
+        void discard() {
+            reusable_ = false;
+        }
 
     private:
         const PostgresPsqlAdapter& owner_;
         std::unique_ptr<PqConnection> connection_;
+        bool reusable_ = true;
     };
 
     mutable std::mutex libpq_pool_mutex_;
@@ -2119,14 +2123,42 @@ private:
         }
     }
 
-    void release_libpq_connection(std::unique_ptr<PqConnection> connection) const {
+    void release_libpq_connection(std::unique_ptr<PqConnection> connection, const bool reusable) const {
         std::lock_guard<std::mutex> lock(libpq_pool_mutex_);
-        if (connection != nullptr && connection->conn != nullptr && PQstatus(connection->conn) == CONNECTION_OK) {
+        const bool connection_ok = connection != nullptr &&
+            connection->conn != nullptr &&
+            PQstatus(connection->conn) == CONNECTION_OK &&
+            PQtransactionStatus(connection->conn) == PQTRANS_IDLE;
+        if (reusable && connection_ok) {
             libpq_pool_.push_back(std::move(connection));
         } else {
             --opened_libpq_connections_;
         }
         libpq_pool_cv_.notify_one();
+    }
+
+    void rollback_failed_libpq_transaction(PqLease& lease) const {
+        PGconn* connection = lease.get();
+        if (connection == nullptr || PQstatus(connection) != CONNECTION_OK) {
+            lease.discard();
+            return;
+        }
+        const auto transaction_status = PQtransactionStatus(connection);
+        if (transaction_status == PQTRANS_UNKNOWN) {
+            lease.discard();
+            return;
+        }
+        if (transaction_status != PQTRANS_INERROR && transaction_status != PQTRANS_INTRANS) {
+            return;
+        }
+        PGresult* rollback_result = PQexec(connection, "ROLLBACK;");
+        const auto rollback_status = rollback_result != nullptr ? PQresultStatus(rollback_result) : PGRES_FATAL_ERROR;
+        if (rollback_result != nullptr) {
+            PQclear(rollback_result);
+        }
+        if (rollback_status != PGRES_COMMAND_OK || PQtransactionStatus(connection) != PQTRANS_IDLE) {
+            lease.discard();
+        }
     }
 
     void exec_sql_libpq(const std::string& sql) const {
@@ -2138,6 +2170,7 @@ private:
             PQclear(result);
         }
         if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
+            rollback_failed_libpq_transaction(lease);
             throw std::runtime_error("libpq exec failed: " + trim(message));
         }
     }
@@ -2151,6 +2184,7 @@ private:
             if (result != nullptr) {
                 PQclear(result);
             }
+            rollback_failed_libpq_transaction(lease);
             throw std::runtime_error("libpq query failed: " + trim(message));
         }
         std::vector<std::vector<std::string>> rows;
@@ -2471,6 +2505,8 @@ private:
     int presence_db_debounce_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_DB_DEBOUNCE_SECONDS", 20);
     int presence_ttl_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_TTL_SECONDS", 60);
     int presence_flush_interval_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_FLUSH_INTERVAL_SECONDS", 5);
+    int presence_flush_batch_size_ = parse_int_env("USER_SERVICE_PRESENCE_FLUSH_BATCH_SIZE", 512);
+    int presence_flush_failure_backoff_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_FLUSH_FAILURE_BACKOFF_SECONDS", 30);
     std::unordered_map<std::string, UserProfile> profiles_;
     std::unordered_map<std::string, PrivacySettings> privacy_;
     std::unordered_map<std::string, RelationshipRecord> relationships_;
@@ -2518,7 +2554,9 @@ private:
         std::optional<std::string> device_id;
         std::string platform;
         Clock::time_point last_db_write_at;
+        Clock::time_point next_flush_attempt_at;
         Clock::time_point expires_at;
+        int flush_failure_count = 0;
         bool dirty = false;
     };
 
@@ -2943,6 +2981,8 @@ private:
             entry.user_id = user_id;
             entry.session_id = session_id;
             entry.last_db_write_at = Clock::time_point{};
+            entry.next_flush_attempt_at = Clock::time_point{};
+            entry.flush_failure_count = 0;
         }
         entry.device_id = device_id;
         entry.platform = platform;
@@ -2965,7 +3005,24 @@ private:
             return;
         }
         it->second.last_db_write_at = Clock::now();
+        it->second.next_flush_attempt_at = Clock::time_point{};
+        it->second.flush_failure_count = 0;
         it->second.dirty = false;
+    }
+
+    void mark_presence_flush_failed(const std::string& user_id, const std::string& session_id) {
+        const auto key = pair_key(user_id, session_id);
+        std::lock_guard<std::mutex> guard(presence_cache_mutex_);
+        const auto it = pending_presence_writes_.find(key);
+        if (it == pending_presence_writes_.end()) {
+            return;
+        }
+        const int capped_failures = std::min(it->second.flush_failure_count, 4);
+        const int multiplier = 1 << capped_failures;
+        const int delay_seconds = std::min(300, std::max(1, presence_flush_failure_backoff_seconds_) * multiplier);
+        it->second.flush_failure_count = std::min(it->second.flush_failure_count + 1, 1000);
+        it->second.next_flush_attempt_at = Clock::now() + std::chrono::seconds(delay_seconds);
+        it->second.dirty = true;
     }
 
     void remove_pending_presence_write(const std::string& user_id, const std::string& session_id) {
@@ -2993,8 +3050,14 @@ private:
                 const bool due = it->second.dirty && (
                     it->second.last_db_write_at == Clock::time_point{} ||
                     now - it->second.last_db_write_at >= std::chrono::seconds(std::max(presence_db_debounce_seconds_, 1)));
-                if (due) {
+                const bool backoff_elapsed =
+                    it->second.next_flush_attempt_at == Clock::time_point{} ||
+                    now >= it->second.next_flush_attempt_at;
+                if (due && backoff_elapsed) {
                     due_writes.push_back(it->second);
+                    if (static_cast<int>(due_writes.size()) >= std::max(1, presence_flush_batch_size_)) {
+                        break;
+                    }
                 }
                 ++it;
             }
@@ -3005,8 +3068,13 @@ private:
                 mark_presence_written(write.user_id, write.session_id);
                 increment_metric("presence.flush");
             } catch (const std::exception& ex) {
+                const std::string error_class = classify_db_error(ex.what());
+                increment_metric("presence_flush_failed_total");
+                increment_metric("presence_flush_failed_total.by_class." + error_class);
+                mark_presence_flush_failed(write.user_id, write.session_id);
                 std::cerr << "presence flush failed userId=" << sanitize_log_value(write.user_id)
                           << " sessionId=" << sanitize_log_value(write.session_id)
+                          << " errorClass=" << error_class
                           << " error=" << sanitize_log_value(ex.what()) << std::endl;
             }
         }
@@ -3167,6 +3235,36 @@ private:
 
     static std::string optional_log_value(const std::optional<long long>& value) {
         return value.has_value() ? std::to_string(*value) : "-";
+    }
+
+    static std::string classify_db_error(std::string message) {
+        message = to_lower(message);
+        if (message.find("current_transaction_is_aborted") != std::string::npos ||
+            message.find("current transaction is aborted") != std::string::npos) {
+            return "current_transaction_is_aborted";
+        }
+        if (message.find("deadlock") != std::string::npos) {
+            return "deadlock";
+        }
+        if (message.find("statement timeout") != std::string::npos ||
+            message.find("canceling statement due to statement timeout") != std::string::npos) {
+            return "statement_timeout";
+        }
+        if (message.find("pool wait timeout") != std::string::npos) {
+            return "pool_wait_timeout";
+        }
+        if (message.find("duplicate key") != std::string::npos ||
+            message.find("unique constraint") != std::string::npos) {
+            return "unique_violation";
+        }
+        if (message.find("foreign key") != std::string::npos) {
+            return "foreign_key_violation";
+        }
+        if (message.find("could not connect") != std::string::npos ||
+            message.find("connection") != std::string::npos) {
+            return "connection";
+        }
+        return "other";
     }
 
     static std::string request_cache_key(const std::string& scope, const std::string& actor_user_id, const std::string& target_user_id) {
