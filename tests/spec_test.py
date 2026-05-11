@@ -46,6 +46,28 @@ def make_user_token(user_id: str) -> str:
     return make_internal_token(INTERNAL_JWT_SECRET, user_id)
 
 
+def make_guest_token(user_id: str, display_name: str = "Guest User") -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {
+        "iss": INTERNAL_JWT_ISSUER,
+        "sub": user_id,
+        "uid": user_id,
+        "userId": user_id,
+        "aud": [INTERNAL_JWT_AUDIENCE],
+        "iat": int(time.time()),
+        "nbf": int(time.time()),
+        "exp": int(time.time()) + 300,
+        "name": display_name,
+        "guest": True,
+        "roomId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "publicId": "ROOMMY",
+        "scope": "meeting:guest",
+    }
+    signing_input = f"{b64url(json.dumps(header, separators=(',', ':')).encode())}.{b64url(json.dumps(payload, separators=(',', ':')).encode())}"
+    signature = hmac.new(INTERNAL_JWT_SECRET.encode(), signing_input.encode(), hashlib.sha256).digest()
+    return f"{signing_input}.{b64url(signature)}"
+
+
 def wait_for_port(host: str, port: int, timeout: float = 10.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -257,6 +279,36 @@ def main() -> int:
 
         red_after_disconnect = request("POST", "/v1/users/presence/query", {"userIds": [alice]}, user_id=bob)
         assert red_after_disconnect["items"][0]["presence"] == "red"
+
+        guest_id = "44444444-4444-4444-8444-444444444444"
+        guest_token = make_guest_token(guest_id, "Guest Load")
+        guest_headers = {
+            "Authorization": f"Bearer {guest_token}",
+            "Content-Type": "application/json",
+        }
+        guest_me = raw_request("GET", "/v1/users/me", headers=guest_headers)
+        assert guest_me["userId"] == guest_id
+        assert guest_me["guest"] is True
+        guest_pulse = raw_request(
+            "POST",
+            "/v1/users/me/presence/pulse",
+            raw_body=json.dumps({
+                "sessionId": "guest-session",
+                "deviceId": "guest-device",
+                "platform": "web",
+            }).encode("utf-8"),
+            headers=guest_headers,
+        )
+        assert guest_pulse["presence"] == "green"
+        guest_presence = request("POST", "/v1/users/presence/query", {"userIds": [guest_id]}, user_id=alice)
+        assert guest_presence["items"][0]["presence"] == "green"
+        guest_disconnect = raw_request(
+            "POST",
+            "/v1/users/me/presence/disconnect",
+            raw_body=json.dumps({"sessionId": "guest-session"}).encode("utf-8"),
+            headers=guest_headers,
+        )
+        assert guest_disconnect["presence"] == "red"
 
         patched = request("PATCH", "/v1/users/me", {
             "displayName": "Alice Cooper",

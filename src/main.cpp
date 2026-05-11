@@ -407,6 +407,17 @@ std::string required_string(const JsonObject& object, const std::string& key) {
     return *value;
 }
 
+std::optional<bool> optional_bool(const JsonObject& object, const std::string& key) {
+    const auto it = object.find(key);
+    if (it == object.end() || it->second.is_null()) {
+        return std::nullopt;
+    }
+    if (!it->second.is_bool()) {
+        throw std::runtime_error("Expected boolean field: " + key);
+    }
+    return it->second.as_bool();
+}
+
 std::vector<std::string> required_string_array(const JsonObject& object, const std::string& key) {
     const auto it = object.find(key);
     if (it == object.end() || !it->second.is_array()) {
@@ -975,7 +986,32 @@ struct JwtPrincipal {
     std::optional<std::string> audience;
     std::optional<long long> exp;
     std::optional<std::string> display_name;
+    bool guest = false;
+    std::optional<std::string> scope;
+    std::optional<std::string> room_id;
+    std::optional<std::string> public_id;
 };
+
+bool is_guest_principal(const JwtPrincipal& principal) {
+    return principal.guest ||
+        (principal.scope.has_value() && to_lower(*principal.scope) == "meeting:guest");
+}
+
+JwtPrincipal legacy_user_principal(const std::string& user_id) {
+    return JwtPrincipal{
+        .raw_user_id = user_id,
+        .canonical_id = user_id,
+        .subject = user_id,
+        .issuer = std::nullopt,
+        .audience = std::nullopt,
+        .exp = std::nullopt,
+        .display_name = std::nullopt,
+        .guest = false,
+        .scope = std::nullopt,
+        .room_id = std::nullopt,
+        .public_id = std::nullopt,
+    };
+}
 
 JwtPrincipal parse_jwt_without_signature_validation(
     const std::string& token,
@@ -1049,6 +1085,10 @@ JwtPrincipal parse_jwt_without_signature_validation(
         .audience = required_audience,
         .exp = payload.count("exp") != 0 && payload.at("exp").is_number() ? std::optional<long long>(static_cast<long long>(payload.at("exp").as_number())) : std::nullopt,
         .display_name = optional_string(payload, "name"),
+        .guest = optional_bool(payload, "guest").value_or(false),
+        .scope = optional_string(payload, "scope"),
+        .room_id = optional_string(payload, "roomId"),
+        .public_id = optional_string(payload, "publicId"),
     };
 }
 
@@ -2728,6 +2768,9 @@ private:
         if (request.method == "POST" && request.path == "/v1/users/me/presence/pulse") {
             return fast_pulse_my_presence(request);
         }
+        if (request.method == "POST" && request.path == "/v1/users/me/presence/disconnect") {
+            return fast_disconnect_my_presence(request);
+        }
         if (request.method == "POST" && request.path == "/v1/users/presence/query") {
             return fast_query_presence(request);
         }
@@ -2850,8 +2893,41 @@ private:
         };
     }
 
+    JsonObject guest_self_profile_response(const JwtPrincipal& principal) const {
+        const std::string timestamp = now_iso8601();
+        JsonObject response{
+            {"userId", principal.canonical_id},
+            {"displayName", principal.display_name.value_or("Guest")},
+            {"username", Json(nullptr)},
+            {"avatarObjectId", Json(nullptr)},
+            {"bio", Json(nullptr)},
+            {"locale", Json(nullptr)},
+            {"timeZone", Json(nullptr)},
+            {"profileStatus", "active"},
+            {"createdAt", timestamp},
+            {"updatedAt", timestamp},
+            {"deletedAt", Json(nullptr)},
+            {"guest", true},
+        };
+        if (principal.scope.has_value()) {
+            response["scope"] = *principal.scope;
+        }
+        if (principal.room_id.has_value()) {
+            response["roomId"] = *principal.room_id;
+        }
+        if (principal.public_id.has_value()) {
+            response["publicId"] = *principal.public_id;
+        }
+        return response;
+    }
+
     Response fast_get_me(const Request& request) {
-        const auto actor_user_id = require_actor_user_id_fast(request);
+        const auto principal = require_actor_principal_fast(request);
+        const auto actor_user_id = principal.canonical_id;
+        if (is_guest_principal(principal)) {
+            increment_metric("profile.read.self.guest");
+            return json_response(200, guest_self_profile_response(principal));
+        }
         if (const auto cached = cached_me_response(actor_user_id)) {
             record_route_cache_result("GET /v1/users/me", true);
             increment_metric("profile.read.self");
@@ -2889,14 +2965,21 @@ private:
     }
 
     Response fast_pulse_my_presence(const Request& request) {
-        const auto actor_user_id = require_actor_user_id_fast(request);
+        const auto principal = require_actor_principal_fast(request);
+        const auto actor_user_id = principal.canonical_id;
+        const bool guest = is_guest_principal(principal);
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
         const std::string session_id = required_string(object, "sessionId");
         const auto device_id = optional_string(object, "deviceId");
         const std::string platform = optional_string(object, "platform").value_or("unknown");
-        const bool write_now = should_write_presence_to_db(actor_user_id, session_id, device_id, platform);
+        const bool write_now = should_write_presence_to_db(actor_user_id, session_id, device_id, platform, !guest);
         record_route_cache_result("POST /v1/users/me/presence/pulse", !write_now);
+        if (guest) {
+            increment_metric("presence.guest_pulse");
+            increment_metric("presence_flush_skipped_total");
+            increment_metric("presence_flush_skipped_total.by_reason.guest_principal");
+        }
         if (write_now) {
             db_.upsert_presence_session(actor_user_id, session_id, device_id, platform);
             mark_presence_written(actor_user_id, session_id);
@@ -2908,6 +2991,31 @@ private:
             {"sessionId", session_id},
             {"presence", "green"},
             {"isOnline", true},
+        });
+    }
+
+    Response fast_disconnect_my_presence(const Request& request) {
+        const auto principal = require_actor_principal_fast(request);
+        const auto actor_user_id = principal.canonical_id;
+        const bool guest = is_guest_principal(principal);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        const std::string session_id = required_string(object, "sessionId");
+        const bool pending_removed = remove_pending_presence_write(actor_user_id, session_id);
+        const bool updated = guest ? pending_removed : db_.disconnect_presence_session(actor_user_id, session_id);
+        if (!guest && !updated && !pending_removed) {
+            return error_response(404, "not_found", "Presence session not found");
+        }
+        if (guest) {
+            increment_metric("presence.guest_disconnect");
+        }
+        increment_metric("presence.disconnect");
+        return json_response(200, JsonObject{
+            {"status", "ok"},
+            {"userId", actor_user_id},
+            {"sessionId", session_id},
+            {"presence", "red"},
+            {"isOnline", false},
         });
     }
 
@@ -2968,10 +3076,8 @@ private:
         const std::string& user_id,
         const std::string& session_id,
         const std::optional<std::string>& device_id,
-        const std::string& platform) {
-        if (presence_db_debounce_seconds_ <= 0) {
-            return true;
-        }
+        const std::string& platform,
+        const bool persist_to_db) {
         const auto now = Clock::now();
         const auto key = pair_key(user_id, session_id);
         std::lock_guard<std::mutex> guard(presence_cache_mutex_);
@@ -2987,6 +3093,13 @@ private:
         entry.device_id = device_id;
         entry.platform = platform;
         entry.expires_at = now + std::chrono::seconds(std::max(presence_ttl_seconds_, 1));
+        if (!persist_to_db) {
+            entry.dirty = false;
+            return false;
+        }
+        if (presence_db_debounce_seconds_ <= 0) {
+            return true;
+        }
         const bool due = entry.last_db_write_at == Clock::time_point{} ||
             now - entry.last_db_write_at >= std::chrono::seconds(std::max(presence_db_debounce_seconds_, 1));
         if (presence_async_db_flush_) {
@@ -3025,9 +3138,9 @@ private:
         it->second.dirty = true;
     }
 
-    void remove_pending_presence_write(const std::string& user_id, const std::string& session_id) {
+    bool remove_pending_presence_write(const std::string& user_id, const std::string& session_id) {
         std::lock_guard<std::mutex> guard(presence_cache_mutex_);
-        pending_presence_writes_.erase(pair_key(user_id, session_id));
+        return pending_presence_writes_.erase(pair_key(user_id, session_id)) > 0U;
     }
 
     void flush_debounced_presence_writes() {
@@ -3179,6 +3292,27 @@ private:
             throw HttpError(401, "unauthorized", "Expected Authorization: Bearer <jwt>");
         }
         return parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_, jwt_secret_).canonical_id;
+    }
+
+    JwtPrincipal require_actor_principal_fast(const Request& request) const {
+        const auto it = request.headers.find("authorization");
+        if (it == request.headers.end()) {
+            throw HttpError(401, "unauthorized", "Missing Authorization header");
+        }
+        const std::string raw_header = trim(it->second);
+        const std::string header = to_lower(raw_header);
+        const std::string legacy_prefix = "bearer user:";
+        if (allow_legacy_user_bearer_ && header.rfind(legacy_prefix, 0) == 0) {
+            return legacy_user_principal(canonical_user_id(trim(raw_header.substr(legacy_prefix.size()))));
+        }
+        if (header.rfind(legacy_prefix, 0) == 0) {
+            throw HttpError(401, "unauthorized", "Legacy Bearer user tokens are disabled");
+        }
+        const std::string bearer_prefix = "bearer ";
+        if (header.rfind(bearer_prefix, 0) != 0) {
+            throw HttpError(401, "unauthorized", "Expected Authorization: Bearer <jwt>");
+        }
+        return parse_jwt_without_signature_validation(trim(raw_header.substr(bearer_prefix.size())), jwt_issuer_, jwt_audience_, jwt_secret_);
     }
 
     void require_internal_token_fast(const Request& request) const {
@@ -3816,15 +3950,7 @@ private:
         const std::string prefix = "bearer user:";
         if (allow_legacy_user_bearer_ && header.rfind(prefix, 0) == 0) {
             const auto actor_user_id = canonical_user_id(trim(raw_header.substr(prefix.size())));
-            current_jwt_principal_ = JwtPrincipal{
-                .raw_user_id = actor_user_id,
-                .canonical_id = actor_user_id,
-                .subject = actor_user_id,
-                .issuer = std::nullopt,
-                .audience = std::nullopt,
-                .exp = std::nullopt,
-                .display_name = std::nullopt,
-            };
+            current_jwt_principal_ = legacy_user_principal(actor_user_id);
             log_auth_result("200", actor_user_id, "allow", "ok", std::nullopt, "legacy", true, true, true);
             return actor_user_id;
         }
@@ -5442,6 +5568,10 @@ private:
 
     Response get_me(const Request& request) {
         const auto actor_user_id = require_actor_user_id(request);
+        if (current_jwt_principal_.has_value() && is_guest_principal(*current_jwt_principal_)) {
+            increment_metric("profile.read.self.guest");
+            return json_response(200, guest_self_profile_response(*current_jwt_principal_));
+        }
         const auto preferred_display_name = actor_display_name_from_jwt(request);
         if (db_.enabled()) {
             increment_metric("profile.read.self");
@@ -5829,16 +5959,27 @@ private:
 
     Response pulse_my_presence(const Request& request) {
         const auto actor_user_id = require_actor_user_id(request);
-        ensure_profile_exists(actor_user_id);
+        const bool guest = current_jwt_principal_.has_value() && is_guest_principal(*current_jwt_principal_);
+        if (!guest) {
+            ensure_profile_exists(actor_user_id);
+        }
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
         const std::string session_id = required_string(object, "sessionId");
         const auto device_id = optional_string(object, "deviceId");
         const std::string platform = optional_string(object, "platform").value_or("unknown");
-        if (db_.enabled()) {
+        if (guest && db_.enabled()) {
+            should_write_presence_to_db(actor_user_id, session_id, device_id, platform, false);
+            increment_metric("presence.guest_pulse");
+            increment_metric("presence_flush_skipped_total");
+            increment_metric("presence_flush_skipped_total.by_reason.guest_principal");
+        } else if (db_.enabled()) {
             db_.upsert_presence_session(actor_user_id, session_id, device_id, platform);
         } else {
             upsert_memory_presence_session(actor_user_id, session_id, device_id, platform);
+            if (guest) {
+                increment_metric("presence.guest_pulse");
+            }
         }
         increment_metric("presence.pulse");
         return json_response(200, JsonObject{
@@ -5852,18 +5993,24 @@ private:
 
     Response disconnect_my_presence(const Request& request) {
         const auto actor_user_id = require_actor_user_id(request);
-        ensure_profile_exists(actor_user_id);
+        const bool guest = current_jwt_principal_.has_value() && is_guest_principal(*current_jwt_principal_);
+        if (!guest) {
+            ensure_profile_exists(actor_user_id);
+        }
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
         const std::string session_id = required_string(object, "sessionId");
-        const bool updated = db_.enabled()
-            ? db_.disconnect_presence_session(actor_user_id, session_id)
-            : disconnect_memory_presence_session(actor_user_id, session_id);
-        if (!updated) {
+        const bool pending_removed = db_.enabled() ? remove_pending_presence_write(actor_user_id, session_id) : false;
+        const bool updated = guest && db_.enabled()
+            ? pending_removed
+            : (db_.enabled()
+                ? db_.disconnect_presence_session(actor_user_id, session_id)
+                : disconnect_memory_presence_session(actor_user_id, session_id));
+        if (!guest && !updated && !pending_removed) {
             return error_response(404, "not_found", "Presence session not found");
         }
-        if (db_.enabled()) {
-            remove_pending_presence_write(actor_user_id, session_id);
+        if (guest) {
+            increment_metric("presence.guest_disconnect");
         }
         increment_metric("presence.disconnect");
         return json_response(200, JsonObject{
@@ -5877,7 +6024,10 @@ private:
 
     Response query_presence(const Request& request) {
         const auto actor_user_id = require_actor_user_id(request);
-        ensure_profile_exists(actor_user_id);
+        const bool actor_guest = current_jwt_principal_.has_value() && is_guest_principal(*current_jwt_principal_);
+        if (!actor_guest) {
+            ensure_profile_exists(actor_user_id);
+        }
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
         auto requested_user_ids = required_string_array(object, "userIds");
@@ -5901,7 +6051,6 @@ private:
         }
         JsonArray items;
         for (const auto& user_id : normalized_user_ids) {
-            ensure_profile_exists(user_id);
             const auto it = by_user_id.find(user_id);
             if (it != by_user_id.end()) {
                 items.emplace_back(presence_to_json(it->second));
