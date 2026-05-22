@@ -132,6 +132,7 @@ def main() -> int:
     env["JWT_SECRET"] = INTERNAL_JWT_SECRET
     env["JWT_ISSUER"] = INTERNAL_JWT_ISSUER
     env["JWT_AUDIENCE"] = INTERNAL_JWT_AUDIENCE
+    env["INTERNAL_TOKEN"] = INTERNAL_JWT_SECRET
     env["PRESENCE_GREEN_TTL_SECONDS"] = "1"
     env["REMINDER_SCAN_INTERVAL_SECONDS"] = "1"
     proc = subprocess.Popen([str(EXE)], cwd=str(ROOT), env=env)
@@ -146,6 +147,35 @@ def main() -> int:
             expected_status=401,
         )
         assert invalid_internal_auth["error"] == "unauthorized"
+
+        bootstrap_user = "aaaaaaaa-1111-4111-8111-aaaaaaaa1111"
+        bootstrap_created = raw_request(
+            "POST",
+            "/internal/users/bootstrap",
+            raw_body=json.dumps({
+                "userId": bootstrap_user,
+                "displayName": "Bootstrap User",
+                "status": "active",
+                "email": "bootstrap@example.test",
+            }).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {INTERNAL_JWT_SECRET}",
+                "Content-Type": "application/json",
+            },
+            expected_status=201,
+        )
+        assert bootstrap_created == {"ok": True, "userId": bootstrap_user, "created": True}
+
+        bootstrap_existing = request(
+            "POST",
+            "/internal/users/bootstrap",
+            {"userId": bootstrap_user, "displayName": "Ignored Retry", "status": "active"},
+            internal=True,
+            expected_status=200,
+        )
+        assert bootstrap_existing == {"ok": True, "userId": bootstrap_user, "created": False}
+        bootstrap_profile = request("GET", f"/internal/users/{bootstrap_user}/profile", internal=True)
+        assert bootstrap_profile["displayName"] == "Bootstrap User"
 
         alice = "11111111-1111-1111-1111-111111111111"
         bob = "22222222-2222-2222-2222-222222222222"

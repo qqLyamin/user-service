@@ -1992,6 +1992,32 @@ public:
         exec_sql(sql);
     }
 
+    bool bootstrap_profile(const std::string& user_id, const std::string& display_name, const std::string& profile_status) const {
+        if (!enabled_) {
+            return false;
+        }
+        const std::string escaped_user_id = shell_escape_single_quotes(user_id);
+        const std::string escaped_display_name = shell_escape_single_quotes(display_name);
+        const std::string escaped_profile_status = shell_escape_single_quotes(profile_status);
+        const std::string event_id = shell_escape_single_quotes(hash_to_uuid("profile-created-" + user_id + now_iso8601()));
+        const std::string sql =
+            "WITH inserted_profile AS ("
+            "INSERT INTO user_profiles (user_id, display_name, username, avatar_object_id, bio, locale, time_zone, profile_status, created_at, updated_at, deleted_at) "
+            "VALUES ('" + escaped_user_id + "','" + escaped_display_name + "',NULL,NULL,NULL,NULL,NULL,'" + escaped_profile_status + "',NOW(),NOW(),NULL) "
+            "ON CONFLICT (user_id) DO NOTHING RETURNING user_id"
+            "), privacy_insert AS ("
+            "INSERT INTO user_privacy_settings (user_id, profile_visibility, dm_policy, friend_request_policy, last_seen_visibility, avatar_visibility, created_at, updated_at) "
+            "VALUES ('" + escaped_user_id + "','public','everyone','everyone','public','public',NOW(),NOW()) "
+            "ON CONFLICT (user_id) DO NOTHING RETURNING user_id"
+            "), event_insert AS ("
+            "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) "
+            "SELECT '" + event_id + "','user_profile','" + escaped_user_id + "','user.profile_created',"
+            "'{\"userId\":\"" + escaped_user_id + "\"}'::jsonb,NOW(),NULL FROM inserted_profile RETURNING 1"
+            ") SELECT COUNT(*)::text FROM inserted_profile;";
+        const auto inserted = query_scalar(sql);
+        return inserted == std::optional<std::string>("1");
+    }
+
     void patch_profile(const std::string& user_id, const JsonObject& patch) const {
         if (!enabled_) {
             return;
@@ -3324,11 +3350,18 @@ private:
             if (header.rfind(bearer_prefix, 0) != 0 || header.rfind("bearer user:", 0) == 0) {
                 throw HttpError(401, "unauthorized", "Expected Authorization: Bearer <jwt>");
             }
-            parse_jwt_without_signature_validation(
-                trim(raw_header.substr(bearer_prefix.size())),
-                effective_internal_jwt_issuer(),
-                effective_internal_jwt_audience(),
-                effective_internal_jwt_secret());
+            const std::string bearer_token = trim(raw_header.substr(bearer_prefix.size()));
+            try {
+                parse_jwt_without_signature_validation(
+                    bearer_token,
+                    effective_internal_jwt_issuer(),
+                    effective_internal_jwt_audience(),
+                    effective_internal_jwt_secret());
+            } catch (const std::exception&) {
+                if (!internal_token_.has_value() || trim(*internal_token_).empty() || bearer_token != trim(*internal_token_)) {
+                    throw;
+                }
+            }
             return;
         }
         const auto it = request.headers.find("x-internal-token");
@@ -3781,6 +3814,9 @@ private:
         if (request.method == "POST" && request.path == "/internal/events") {
             return ingest_event(request);
         }
+        if (request.method == "POST" && request.path == "/internal/users/bootstrap") {
+            return internal_bootstrap_user(request);
+        }
         if (request.method == "POST" && request.path == "/internal/users/batch") {
             return internal_batch_profiles(request);
         }
@@ -4013,6 +4049,11 @@ private:
                     effective_internal_jwt_audience(),
                     effective_internal_jwt_secret());
             } catch (const std::exception& ex) {
+                const std::string bearer_token = trim(raw_header.substr(bearer_prefix.size()));
+                if (internal_token_.has_value() && !trim(*internal_token_).empty() && bearer_token == trim(*internal_token_)) {
+                    log_auth_result("200", "internal-token", "allow", "legacy_internal_token", std::nullopt, "true", true, true, true);
+                    return;
+                }
                 const std::string reason = auth_failure_reason(ex.what());
                 log_auth_result("401", "-", "deny", reason, std::nullopt, "false", true, true, false);
                 throw HttpError(401, "unauthorized", ex.what());
@@ -4819,6 +4860,13 @@ private:
         }
     }
 
+    void validate_profile_status(const std::string& value) const {
+        static const std::set<std::string> allowed = {"active", "disabled", "deleted"};
+        if (!allowed.count(value)) {
+            throw std::runtime_error("Invalid profileStatus");
+        }
+    }
+
     void validate_profile_visibility(const std::string& value) const {
         static const std::set<std::string> allowed = {"public", "friends_only", "private"};
         if (!allowed.count(value)) {
@@ -5358,6 +5406,37 @@ private:
     Response internal_contract_error_response(const int status, const std::string& error) {
         increment_metric("http.error." + std::to_string(status));
         return json_response(status, JsonObject{{"error", error}});
+    }
+
+    Response internal_bootstrap_user(const Request& request) {
+        require_internal_token(request);
+        const Json body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        const std::string user_id = canonical_user_id(required_string(object, "userId"));
+        const std::string display_name = optional_string(object, "displayName").value_or("User " + user_id.substr(0, std::min<std::size_t>(8, user_id.size())));
+        const std::string profile_status = optional_string(object, "status").value_or("active");
+        validate_display_name(display_name);
+        validate_profile_status(profile_status);
+
+        bool created = false;
+        if (db_.enabled()) {
+            created = db_.bootstrap_profile(user_id, display_name, profile_status);
+            request_db_profile_cache_.erase(request_cache_key("db_profile", user_id));
+            request_db_privacy_cache_.erase(request_cache_key("db_privacy", user_id));
+        } else {
+            const bool existed = profiles_.count(user_id) != 0;
+            auto& profile = ensure_memory_profile_exists(user_id, display_name);
+            if (!existed) {
+                profile.profile_status = profile_status;
+                publish_event("user.profile_created", JsonObject{{"userId", user_id}});
+                increment_metric("profile.created");
+            }
+            created = !existed;
+        }
+
+        invalidate_user_cache(user_id);
+        increment_metric(created ? "profile.bootstrap.created" : "profile.bootstrap.existing");
+        return json_response(created ? 201 : 200, JsonObject{{"ok", true}, {"userId", user_id}, {"created", created}});
     }
 
     JsonObject internal_profile_contract_json(const JsonObject& profile) const {
