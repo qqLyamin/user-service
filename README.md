@@ -70,6 +70,7 @@ $env:USER_SERVICE_PORT=8080
 - `DELETE /v1/users/{userId}/friend`
 - `POST /v1/users/{userId}/block`
 - `DELETE /v1/users/{userId}/block`
+- `GET /v1/users/{userId}/relationship-capabilities`
 - `GET /v1/users/me/privacy`
 - `PATCH /v1/users/me/privacy`
 - `POST /v1/users/me/presence/pulse`
@@ -88,6 +89,7 @@ $env:USER_SERVICE_PORT=8080
 - `GET /internal/users/{userId}/profile`
 - `POST /internal/users/batch`
 - `POST /internal/users/relationships/check`
+- `POST /internal/users/relationships/check-batch`
 - `POST /internal/users/{userId}/authorize-profile-read`
 - `GET /internal/outbox`
 - `GET /internal/audit-log`
@@ -106,7 +108,34 @@ $env:USER_SERVICE_PORT=8080
 }
 ```
 
-Response:
+## Relationship Capabilities
+
+`user-service` is the authority for personal privacy, relationships, DM and direct-call permissions.
+
+Supported relationship actions:
+
+- `profile.read`
+- `friend.request.send`
+- `dm.start`
+- `dm.read`
+- `dm.read_legacy`
+- `dm.write`
+- `dm.call_start`
+- `dm.call_invite`
+- `dm.block`
+- `dm.unblock`
+
+`POST /internal/users/relationships/check` accepts one action, and `POST /internal/users/relationships/check-batch` accepts `actions: []`. Both return `allowed`, `reason`, `relationship`, `blockedState` and `capabilitiesVersion`.
+
+`GET /v1/users/{userId}/relationship-capabilities` returns the current viewer's `availableActions`, `blockedState`, `privacy`, `reasonByAction` and `capabilitiesVersion` for client UI.
+
+Block policy:
+
+- any active block disables live DM read/write/call actions.
+- `dm.read_legacy` stays allowed after either side blocked, so the client can show history written before the block.
+- only the blocker receives `dm.unblock`; the blocked counterparty receives `dm.block` so they can block back, but cannot remove the other side's block.
+
+Profile batch response:
 
 ```json
 {

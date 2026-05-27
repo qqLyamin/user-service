@@ -2686,6 +2686,9 @@ private:
         if (request.path == "/internal/users/relationships/check") {
             return request.method + " /internal/users/relationships/check";
         }
+        if (request.path == "/internal/users/relationships/check-batch") {
+            return request.method + " /internal/users/relationships/check-batch";
+        }
         if (starts_with(request.path, "/internal/users/") && ends_with(request.path, "/profile")) {
             return request.method + " /internal/users/{userId}/profile";
         }
@@ -2712,6 +2715,9 @@ private:
         if (starts_with(request.path, "/v1/users/") && ends_with(request.path, "/block")) {
             return request.method + " /v1/users/{userId}/block";
         }
+        if (starts_with(request.path, "/v1/users/") && ends_with(request.path, "/relationship-capabilities")) {
+            return request.method + " /v1/users/{userId}/relationship-capabilities";
+        }
         return request.method + " " + request.path;
     }
 
@@ -2731,7 +2737,8 @@ private:
         if (route == "GET /internal/users/{userId}/profile") {
             return route_internal_profile_inflight_limit_;
         }
-        if (route == "POST /internal/users/relationships/check") {
+        if (route == "POST /internal/users/relationships/check" ||
+            route == "POST /internal/users/relationships/check-batch") {
             return route_relationship_check_inflight_limit_;
         }
         return route_default_inflight_limit_;
@@ -3238,7 +3245,7 @@ private:
 
         bool allowed = false;
         std::string reason;
-        if (action == "dm.start" || action == "dm.read" || action == "dm.write") {
+        if (is_dm_live_action(action)) {
             if (actor_user_id == target_user_id) {
                 reason = "self_dm_not_supported";
             } else if (snapshot.is_blocked) {
@@ -3251,6 +3258,21 @@ private:
                 allowed = true;
             } else {
                 reason = "dm_policy_denied";
+            }
+        } else if (action == "dm.read_legacy") {
+            allowed = actor_user_id != target_user_id && (snapshot.is_blocked || snapshot.is_blocked_by_target);
+            if (!allowed) {
+                reason = actor_user_id == target_user_id ? "self_dm_not_supported" : "not_blocked";
+            }
+        } else if (action == "dm.block") {
+            allowed = actor_user_id != target_user_id && !snapshot.is_blocked;
+            if (!allowed) {
+                reason = actor_user_id == target_user_id ? "self_block_not_supported" : "already_blocked_by_actor";
+            }
+        } else if (action == "dm.unblock") {
+            allowed = actor_user_id != target_user_id && snapshot.is_blocked;
+            if (!allowed) {
+                reason = actor_user_id == target_user_id ? "self_unblock_not_supported" : "no_actor_block";
             }
         } else if (action == "profile.read") {
             if (actor_user_id == target_user_id) {
@@ -3296,6 +3318,8 @@ private:
                 {"isBlocked", snapshot.is_blocked},
                 {"isBlockedByTarget", snapshot.is_blocked_by_target},
             }},
+            {"blockedState", blocked_state_json(snapshot.is_blocked, snapshot.is_blocked_by_target)},
+            {"capabilitiesVersion", relationship_capabilities_version(actor_user_id, target_user_id)},
         });
     }
 
@@ -3826,6 +3850,9 @@ private:
         if (request.method == "POST" && request.path == "/internal/users/relationships/check") {
             return internal_relationship_check(request);
         }
+        if (request.method == "POST" && request.path == "/internal/users/relationships/check-batch") {
+            return internal_relationship_check_batch(request);
+        }
         if (starts_with(request.path, "/internal/users/") && ends_with(request.path, "/authorize-profile-read") && request.method == "POST") {
             return internal_authorize_profile_read(request);
         }
@@ -3916,6 +3943,9 @@ private:
         const auto target_user_id = segments.size() >= 3 ? canonical_user_id(segments[2]) : std::string{};
         if (segments.size() == 3 && request.method == "GET") {
             return get_user_by_id(request, target_user_id);
+        }
+        if (segments.size() == 4 && segments[3] == "relationship-capabilities" && request.method == "GET") {
+            return relationship_capabilities(request, target_user_id);
         }
         if (segments.size() == 4 && segments[3] == "friend-request" && request.method == "POST") {
             return send_friend_request(request, target_user_id);
@@ -5555,7 +5585,18 @@ private:
 
     std::string normalize_relationship_action(const JsonObject& object) const {
         if (const auto action = optional_string(object, "action")) {
-            return *action;
+            const auto normalized = to_lower(trim(*action));
+            static const std::map<std::string, std::string> aliases{
+                {"dm.call.start", "dm.call_start"},
+                {"dm.call.invite", "dm.call_invite"},
+                {"call.start", "dm.call_start"},
+                {"call.invite", "dm.call_invite"},
+                {"read_legacy", "dm.read_legacy"},
+                {"block", "dm.block"},
+                {"unblock", "dm.unblock"},
+            };
+            const auto it = aliases.find(normalized);
+            return it == aliases.end() ? normalized : it->second;
         }
         if (const auto policy_type = optional_string(object, "policyType")) {
             if (*policy_type == "dm") {
@@ -5578,6 +5619,77 @@ private:
         throw std::runtime_error("Missing string field: action");
     }
 
+    static std::string relationship_capabilities_version(const std::string& actor_user_id, const std::string& target_user_id) {
+        return "rel-" + actor_user_id + "-" + target_user_id;
+    }
+
+    static JsonObject blocked_state_json(const bool blocked_by_me, const bool blocked_by_other) {
+        return JsonObject{
+            {"blocked", blocked_by_me || blocked_by_other},
+            {"blockedByMe", blocked_by_me},
+            {"blockedByOther", blocked_by_other},
+            {"canUnblock", blocked_by_me},
+            {"canBlockBack", blocked_by_other && !blocked_by_me},
+        };
+    }
+
+    static bool is_dm_live_action(const std::string& action) {
+        return action == "dm.start" || action == "dm.read" || action == "dm.write" ||
+               action == "dm.call_start" || action == "dm.call_invite";
+    }
+
+    std::pair<bool, std::string> relationship_action_decision(const std::string& actor_user_id,
+                                                              const std::string& target_user_id,
+                                                              const std::string& action,
+                                                              const RelationshipSummary& summary) {
+        bool allowed = false;
+        std::string reason;
+        if (is_dm_live_action(action)) {
+            allowed = db_.enabled()
+                ? authorize_dm_action_db(actor_user_id, target_user_id, reason)
+                : authorize_dm_start(actor_user_id, target_user_id, reason);
+        } else if (action == "dm.read_legacy") {
+            allowed = actor_user_id != target_user_id && (summary.is_blocked || summary.is_blocked_by_target);
+            if (!allowed) {
+                reason = actor_user_id == target_user_id ? "self_dm_not_supported" : "not_blocked";
+            }
+        } else if (action == "dm.block") {
+            allowed = actor_user_id != target_user_id && !summary.is_blocked;
+            if (!allowed) {
+                reason = actor_user_id == target_user_id ? "self_block_not_supported" : "already_blocked_by_actor";
+            }
+        } else if (action == "dm.unblock") {
+            allowed = actor_user_id != target_user_id && summary.is_blocked;
+            if (!allowed) {
+                reason = actor_user_id == target_user_id ? "self_unblock_not_supported" : "no_actor_block";
+            }
+        } else if (action == "profile.read") {
+            allowed = db_.enabled()
+                ? authorize_profile_read_db(actor_user_id, target_user_id)
+                : authorize_profile_read(actor_user_id, target_user_id);
+            if (!allowed) {
+                reason = "profile_visibility_denied";
+            }
+        } else if (action == "friend.request.send") {
+            allowed = db_.enabled()
+                ? allows_friend_request_db(actor_user_id, target_user_id, reason)
+                : allows_friend_request(actor_user_id, target_user_id, reason);
+        } else if (action == "friendship.status") {
+            allowed = summary.is_friend;
+            if (!allowed) {
+                reason = "not_friends";
+            }
+        } else if (action == "block.status") {
+            allowed = !(summary.is_blocked || summary.is_blocked_by_target);
+            if (!allowed) {
+                reason = summary.is_blocked ? "blocked_by_actor" : "blocked_by_target";
+            }
+        } else {
+            throw std::runtime_error("Unsupported action: " + action);
+        }
+        return {allowed, reason};
+    }
+
     Response internal_relationship_check(const Request& request) {
         require_internal_token(request);
         const auto body = JsonParser(request.body).parse();
@@ -5595,10 +5707,25 @@ private:
 
         bool allowed = false;
         std::string reason;
-        if (action == "dm.start" || action == "dm.read" || action == "dm.write") {
+        if (is_dm_live_action(action)) {
             allowed = db_.enabled()
                 ? authorize_dm_action_db(actor_user_id, target_user_id, reason)
                 : authorize_dm_start(actor_user_id, target_user_id, reason);
+        } else if (action == "dm.read_legacy") {
+            allowed = actor_user_id != target_user_id && (summary.is_blocked || summary.is_blocked_by_target);
+            if (!allowed) {
+                reason = actor_user_id == target_user_id ? "self_dm_not_supported" : "not_blocked";
+            }
+        } else if (action == "dm.block") {
+            allowed = actor_user_id != target_user_id && !summary.is_blocked;
+            if (!allowed) {
+                reason = actor_user_id == target_user_id ? "self_block_not_supported" : "already_blocked_by_actor";
+            }
+        } else if (action == "dm.unblock") {
+            allowed = actor_user_id != target_user_id && summary.is_blocked;
+            if (!allowed) {
+                reason = actor_user_id == target_user_id ? "self_unblock_not_supported" : "no_actor_block";
+            }
         } else if (action == "profile.read") {
             allowed = db_.enabled()
                 ? authorize_profile_read_db(actor_user_id, target_user_id)
@@ -5631,6 +5758,51 @@ private:
                 {"isBlocked", summary.is_blocked},
                 {"isBlockedByTarget", summary.is_blocked_by_target},
             }},
+            {"blockedState", blocked_state_json(summary.is_blocked, summary.is_blocked_by_target)},
+            {"capabilitiesVersion", relationship_capabilities_version(actor_user_id, target_user_id)},
+        });
+    }
+
+    Response internal_relationship_check_batch(const Request& request) {
+        require_internal_token(request);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        const std::string actor_user_id = canonical_user_id(required_string(object, "actorUserId"));
+        const std::string target_user_id = canonical_user_id(required_string(object, "targetUserId"));
+        const auto actions = required_string_array(object, "actions");
+        if (actions.empty()) {
+            throw std::runtime_error("Expected non-empty string array field: actions");
+        }
+
+        ensure_profile_exists(actor_user_id);
+        ensure_profile_exists(target_user_id);
+        const auto summary = db_.enabled()
+            ? db_relationship_summary(actor_user_id, target_user_id)
+            : relationship_summary(actor_user_id, target_user_id);
+
+        JsonObject decisions;
+        for (const auto& requested_action : actions) {
+            JsonObject action_object{{"action", requested_action}};
+            const auto action = normalize_relationship_action(action_object);
+            const auto [allowed, reason] = relationship_action_decision(actor_user_id, target_user_id, action, summary);
+            decisions[action] = JsonObject{
+                {"allowed", allowed},
+                {"reason", reason.empty() ? Json(nullptr) : Json(reason)},
+            };
+        }
+
+        increment_metric("relationship.check_batch");
+        return json_response(200, JsonObject{
+            {"actorUserId", actor_user_id},
+            {"targetUserId", target_user_id},
+            {"decisions", decisions},
+            {"relationship", JsonObject{
+                {"isFriend", summary.is_friend},
+                {"isBlocked", summary.is_blocked},
+                {"isBlockedByTarget", summary.is_blocked_by_target},
+            }},
+            {"blockedState", blocked_state_json(summary.is_blocked, summary.is_blocked_by_target)},
+            {"capabilitiesVersion", relationship_capabilities_version(actor_user_id, target_user_id)},
         });
     }
 
@@ -5766,6 +5938,67 @@ private:
             actor_user_id == user_id ? "self_profile" : "public_profile",
             "authorized_profile_read",
             summary.is_friend));
+    }
+
+    Response relationship_capabilities(const Request& request, const std::string& target_user_id) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        ensure_profile_exists(target_user_id);
+        const auto summary = db_.enabled()
+            ? db_relationship_summary(actor_user_id, target_user_id)
+            : relationship_summary(actor_user_id, target_user_id);
+
+        static const std::vector<std::string> actions{
+            "profile.read",
+            "friend.request.send",
+            "dm.start",
+            "dm.read",
+            "dm.read_legacy",
+            "dm.write",
+            "dm.call_start",
+            "dm.call_invite",
+            "dm.block",
+            "dm.unblock",
+        };
+
+        JsonArray available_actions;
+        JsonObject reason_by_action;
+        for (const auto& action : actions) {
+            const auto [allowed, reason] = relationship_action_decision(actor_user_id, target_user_id, action, summary);
+            if (allowed) {
+                available_actions.emplace_back(action);
+            } else {
+                reason_by_action[action] = reason.empty() ? Json("forbidden") : Json(reason);
+            }
+        }
+
+        JsonObject privacy;
+        if (db_.enabled()) {
+            const auto& target_privacy = ensure_db_privacy_exists_and_load(target_user_id);
+            privacy = JsonObject{
+                {"targetDmPolicy", required_string(target_privacy, "dmPolicy")},
+                {"targetProfileVisibility", required_string(target_privacy, "profileVisibility")},
+                {"targetFriendRequestPolicy", required_string(target_privacy, "friendRequestPolicy")},
+            };
+        } else {
+            const auto& target_privacy = require_privacy_const(target_user_id);
+            privacy = JsonObject{
+                {"targetDmPolicy", target_privacy.dm_policy},
+                {"targetProfileVisibility", target_privacy.profile_visibility},
+                {"targetFriendRequestPolicy", target_privacy.friend_request_policy},
+            };
+        }
+
+        return json_response(200, JsonObject{
+            {"subject", JsonObject{{"userId", actor_user_id}}},
+            {"target", JsonObject{{"userId", target_user_id}}},
+            {"relationshipStatus", summary.is_blocked || summary.is_blocked_by_target ? Json("blocked") : Json(summary.is_friend ? "friends" : "none")},
+            {"availableActions", available_actions},
+            {"blockedState", blocked_state_json(summary.is_blocked, summary.is_blocked_by_target)},
+            {"privacy", privacy},
+            {"reasonByAction", reason_by_action},
+            {"capabilitiesVersion", relationship_capabilities_version(actor_user_id, target_user_id)},
+        });
     }
 
     Response get_my_privacy(const Request& request) {

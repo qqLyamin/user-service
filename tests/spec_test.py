@@ -419,6 +419,29 @@ def main() -> int:
         }, internal=True)
         assert allowed_dm["allowed"] is True
         assert allowed_dm["relationship"]["isFriend"] is True
+        allowed_dm_read = request("POST", "/internal/users/relationships/check", {
+            "actorUserId": alice,
+            "targetUserId": bob,
+            "action": "dm.read",
+        }, internal=True)
+        assert allowed_dm_read["allowed"] is True
+        allowed_dm_call = request("POST", "/internal/users/relationships/check", {
+            "actorUserId": alice,
+            "targetUserId": bob,
+            "action": "dm.call_start",
+        }, internal=True)
+        assert allowed_dm_call["allowed"] is True
+        allowed_relationship_batch = request("POST", "/internal/users/relationships/check-batch", {
+            "actorUserId": alice,
+            "targetUserId": bob,
+            "actions": ["dm.read", "dm.write", "dm.call_invite"],
+        }, internal=True)
+        assert allowed_relationship_batch["decisions"]["dm.read"]["allowed"] is True
+        assert allowed_relationship_batch["decisions"]["dm.write"]["allowed"] is True
+        assert allowed_relationship_batch["decisions"]["dm.call_invite"]["allowed"] is True
+        relationship_caps = request("GET", f"/v1/users/{bob}/relationship-capabilities", user_id=alice)
+        assert "dm.write" in relationship_caps["availableActions"]
+        assert relationship_caps["blockedState"]["blocked"] is False
 
         contacts = request("GET", "/v1/users/me/contacts?limit=10&offset=0", user_id=alice)
         assert len(contacts["items"]) == 1
@@ -545,6 +568,25 @@ def main() -> int:
         }, internal=True)
         assert blocked_dm["allowed"] is False
         assert blocked_dm["relationship"]["isBlocked"] is True
+        blocked_dm_read = request("POST", "/internal/users/relationships/check", {
+            "actorUserId": alice,
+            "targetUserId": bob,
+            "action": "dm.read",
+        }, internal=True)
+        assert blocked_dm_read["allowed"] is False
+        blocked_dm_legacy = request("POST", "/internal/users/relationships/check", {
+            "actorUserId": alice,
+            "targetUserId": bob,
+            "action": "dm.read_legacy",
+        }, internal=True)
+        assert blocked_dm_legacy["allowed"] is True
+        blocked_caps = request("GET", f"/v1/users/{bob}/relationship-capabilities", user_id=alice)
+        assert "dm.read_legacy" in blocked_caps["availableActions"]
+        assert "dm.write" not in blocked_caps["availableActions"]
+        assert blocked_caps["blockedState"]["blockedByMe"] is True
+        blocked_counterparty_caps = request("GET", f"/v1/users/{alice}/relationship-capabilities", user_id=bob)
+        assert blocked_counterparty_caps["blockedState"]["blockedByOther"] is True
+        assert blocked_counterparty_caps["blockedState"]["canBlockBack"] is True
 
         hidden_conversations = request("GET", "/v1/users/me/conversations?limit=10&offset=0", user_id=alice)
         assert hidden_conversations["items"] == []
