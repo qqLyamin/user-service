@@ -4,8 +4,9 @@ User domain service in C++20 with a self-contained HTTP server, deploy assets, m
 
 ## What is implemented
 
-- Profile source of truth: `displayName`, `username`, `avatarObjectId`, `bio`, `locale`, `timeZone`, lifecycle projection status
+- Profile source of truth: `displayName`, `username`, legacy `avatarObjectId`, `avatar.previewObjectId`, `avatar.fullObjectId`, `bio`, `locale`, `timeZone`, lifecycle projection status
 - Privacy source of truth: profile visibility, DM policy, friend request policy, last seen visibility, avatar visibility
+- User-owned chat pins for personal/direct and group chats
 - Directional friendship model: pending outgoing/incoming, accepted, declined, removed
 - Block list with immediate DM visibility suppression in projections
 - Internal relationship authorization API
@@ -73,6 +74,10 @@ $env:USER_SERVICE_PORT=8080
 - `GET /v1/users/{userId}/relationship-capabilities`
 - `GET /v1/users/me/privacy`
 - `PATCH /v1/users/me/privacy`
+- `GET /v1/users/me/chat-pins`
+- `POST /v1/users/me/chat-pins`
+- `PUT /v1/users/me/chat-pins/order`
+- `DELETE /v1/users/me/chat-pins/{chatType}/{chatId}`
 - `POST /v1/users/me/presence/pulse`
 - `POST /v1/users/me/presence/disconnect`
 - `POST /v1/users/presence/query`
@@ -143,6 +148,13 @@ Profile batch response:
     {
       "userId": "11111111-1111-1111-1111-111111111111",
       "displayName": "IGOR22",
+      "avatarObjectId": "media_avatar_128",
+      "avatarPreviewObjectId": "media_avatar_128",
+      "avatarFullObjectId": "media_avatar_full",
+      "avatar": {
+        "previewObjectId": "media_avatar_128",
+        "fullObjectId": "media_avatar_full"
+      },
       "profileStatus": "active"
     }
   ]
@@ -150,6 +162,90 @@ Profile batch response:
 ```
 
 The endpoint requires internal auth, accepts up to 100 UUID values, preserves first-seen request order, and omits unknown users. Contract errors are `400 {"error":"VALIDATION_ERROR"}`, `401 {"error":"UNAUTHORIZED"}`, and `503 {"error":"USER_SERVICE_UNAVAILABLE"}`.
+
+## Avatar contract
+
+`user-service` stores avatar media object ids returned by `media-service`. `avatarObjectId` is kept as the legacy preview field. New clients should use `avatar.previewObjectId` for lists, sidebars, participant chips and distant previews, and `avatar.fullObjectId` for profile/fullscreen views opened by click.
+
+Patch self profile:
+
+```json
+PATCH /v1/users/me
+{
+  "avatar": {
+    "previewObjectId": "media_avatar_128",
+    "fullObjectId": "media_avatar_full"
+  }
+}
+```
+
+Profile responses include both the flat compatibility fields and the grouped contract:
+
+```json
+{
+  "avatarObjectId": "media_avatar_128",
+  "avatarPreviewObjectId": "media_avatar_128",
+  "avatarFullObjectId": "media_avatar_full",
+  "avatar": {
+    "previewObjectId": "media_avatar_128",
+    "fullObjectId": "media_avatar_full"
+  }
+}
+```
+
+When avatar privacy hides the avatar, all avatar fields are returned as `null`.
+
+## Chat Pins
+
+Chat pins are user preferences owned by `user-service`; `chat-service` does not need to store or resolve pin state. Clients should load chats from `chat-service`, load pins from `user-service`, and sort matching chats above the regular list.
+
+Supported `chatType` values are `direct` and `group`; aliases `direct_chat`, `dm`, `private`, `group_chat` are accepted and stored canonically.
+
+Pin or update a chat:
+
+```json
+POST /v1/users/me/chat-pins
+{
+  "chatType": "group",
+  "chatId": "group-123",
+  "sortOrder": 0
+}
+```
+
+List current pins:
+
+```json
+GET /v1/users/me/chat-pins
+{
+  "items": [
+    {
+      "chatType": "group",
+      "chatId": "group-123",
+      "sortOrder": 0,
+      "pinnedAt": "2026-05-27T12:00:00.000Z",
+      "updatedAt": "2026-05-27T12:00:00.000Z"
+    }
+  ]
+}
+```
+
+Reorder pins without deleting missing items:
+
+```json
+PUT /v1/users/me/chat-pins/order
+{
+  "items": [
+    {"chatType": "direct", "chatId": "conv-1", "sortOrder": 0},
+    {"chatType": "group", "chatId": "group-123", "sortOrder": 1}
+  ]
+}
+```
+
+Unpin:
+
+```http
+DELETE /v1/users/me/chat-pins/group/group-123
+```
 
 ## Internal event ingestion
 

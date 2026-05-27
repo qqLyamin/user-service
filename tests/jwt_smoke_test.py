@@ -74,11 +74,20 @@ def main() -> int:
     try:
         wait_for_port()
         before = request("GET", "/v1/users/me", token)
-        patched = request("PATCH", "/v1/users/me", token, {"displayName": "CI Smoke Updated"})
+        patched = request("PATCH", "/v1/users/me", token, {
+            "displayName": "CI Smoke Updated",
+            "avatar": {
+                "previewObjectId": "ci-avatar-preview",
+                "fullObjectId": "ci-avatar-full",
+            },
+        })
         after = request("GET", "/v1/users/me", token)
         assert before["userId"]
         assert patched["displayName"] == "CI Smoke Updated"
+        assert patched["avatarObjectId"] == "ci-avatar-preview"
+        assert patched["avatar"]["fullObjectId"] == "ci-avatar-full"
         assert after["displayName"] == "CI Smoke Updated"
+        assert after["avatar"]["previewObjectId"] == "ci-avatar-preview"
         health = urllib.request.urlopen("http://127.0.0.1:18081/health", timeout=5)
         assert health.status == 200
         print("JWT SMOKE PASSED")

@@ -342,13 +342,18 @@ def main() -> int:
 
         patched = request("PATCH", "/v1/users/me", {
             "displayName": "Alice Cooper",
-            "avatarObjectId": "obj_avatar_alice",
+            "avatarPreviewObjectId": "obj_avatar_alice_preview",
+            "avatarFullObjectId": "obj_avatar_alice_full",
             "bio": "MVP owner",
             "locale": "en-US",
             "timeZone": "Europe/Warsaw",
         }, user_id=alice)
         assert patched["displayName"] == "Alice Cooper"
-        assert patched["avatarObjectId"] == "obj_avatar_alice"
+        assert patched["avatarObjectId"] == "obj_avatar_alice_preview"
+        assert patched["avatarPreviewObjectId"] == "obj_avatar_alice_preview"
+        assert patched["avatarFullObjectId"] == "obj_avatar_alice_full"
+        assert patched["avatar"]["previewObjectId"] == "obj_avatar_alice_preview"
+        assert patched["avatar"]["fullObjectId"] == "obj_avatar_alice_full"
 
         alice_privacy = request("PATCH", "/v1/users/me/privacy", {
             "avatarVisibility": "public",
@@ -356,13 +361,16 @@ def main() -> int:
         assert alice_privacy["avatarVisibility"] == "public"
 
         alice_internal_profile = request("GET", f"/internal/users/{alice}/profile", internal=True)
-        assert alice_internal_profile["avatarObjectId"] == "obj_avatar_alice"
+        assert alice_internal_profile["avatarObjectId"] == "obj_avatar_alice_preview"
+        assert alice_internal_profile["avatar"]["fullObjectId"] == "obj_avatar_alice_full"
 
         batch_profiles = request("POST", "/internal/users/batch", {"userIds": [alice, bob, alice.upper()]}, internal=True)
-        assert batch_profiles["users"] == [
-            {"userId": alice, "displayName": "Alice Cooper", "profileStatus": "active"},
-            {"userId": bob, "displayName": "Bob", "profileStatus": "active"},
-        ]
+        assert len(batch_profiles["users"]) == 2
+        assert batch_profiles["users"][0]["userId"] == alice
+        assert batch_profiles["users"][0]["displayName"] == "Alice Cooper"
+        assert batch_profiles["users"][0]["avatarPreviewObjectId"] == "obj_avatar_alice_preview"
+        assert batch_profiles["users"][1]["userId"] == bob
+        assert batch_profiles["users"][1]["displayName"] == "Bob"
 
         invalid_batch_uuid = request("POST", "/internal/users/batch", {"userIds": ["not-a-uuid"]}, internal=True, expected_status=400)
         assert invalid_batch_uuid["error"] == "VALIDATION_ERROR"
@@ -411,6 +419,7 @@ def main() -> int:
         bob_view = request("GET", f"/v1/users/{bob}", user_id=alice)
         assert bob_view["displayName"] == "Bob"
         assert bob_view["avatarObjectId"] is None
+        assert bob_view["avatar"]["previewObjectId"] is None
 
         allowed_dm = request("POST", "/internal/users/relationships/check", {
             "actorUserId": alice,
@@ -496,6 +505,35 @@ def main() -> int:
         conversations = request("GET", "/v1/users/me/conversations?limit=10&offset=0", user_id=alice)
         assert len(conversations["items"]) == 1
         assert conversations["items"][0]["entityId"] == "conv-1"
+
+        empty_pins = request("GET", "/v1/users/me/chat-pins", user_id=alice)
+        assert empty_pins["items"] == []
+        direct_pin = request("POST", "/v1/users/me/chat-pins", {
+            "chatType": "direct",
+            "chatId": "conv-1",
+            "sortOrder": 1,
+        }, user_id=alice)
+        assert direct_pin["pin"]["chatType"] == "direct"
+        assert direct_pin["pin"]["chatId"] == "conv-1"
+        group_pin = request("POST", "/v1/users/me/chat-pins", {
+            "targetType": "group_chat",
+            "targetId": "group-1",
+            "sortOrder": 0,
+        }, user_id=alice)
+        assert group_pin["pin"]["chatType"] == "group"
+        ordered_pins = request("GET", "/v1/users/me/chat-pins", user_id=alice)
+        assert [item["chatId"] for item in ordered_pins["items"]] == ["group-1", "conv-1"]
+        reordered_pins = request("PUT", "/v1/users/me/chat-pins/order", {
+            "items": [
+                {"chatType": "direct", "chatId": "conv-1", "sortOrder": 0},
+                {"chatType": "group", "chatId": "group-1", "sortOrder": 1},
+            ],
+        }, user_id=alice)
+        assert [item["chatId"] for item in reordered_pins["items"]] == ["conv-1", "group-1"]
+        deleted_pin = request("DELETE", "/v1/users/me/chat-pins/direct/conv-1", user_id=alice)
+        assert deleted_pin["removed"] is True
+        pins_after_delete = request("GET", "/v1/users/me/chat-pins", user_id=alice)
+        assert [item["chatId"] for item in pins_after_delete["items"]] == ["group-1"]
 
         post_event("call.history_recorded", "evt-6a", {
             "callId": "call-1",
@@ -623,6 +661,9 @@ def main() -> int:
             "user.call_history_deleted",
             "user.call_history_cleared",
             "user.privacy_updated",
+            "user.chat_pin_upserted",
+            "user.chat_pin_removed",
+            "user.chat_pins_reordered",
             "user.disabled",
             "user.deleted",
         }:
@@ -640,6 +681,9 @@ def main() -> int:
             "block.remove",
             "call_history.delete",
             "call_history.clear",
+            "chat_pin.upsert",
+            "chat_pin.remove",
+            "chat_pin.reorder",
         }:
             assert required in actions, required
 
@@ -658,6 +702,9 @@ def main() -> int:
             "call_history.deleted",
             "call_history.cleared",
             "projection.added",
+            "chat_pin.upserted",
+            "chat_pin.removed",
+            "chat_pin.reordered",
         ]:
             assert required in counters, required
 

@@ -407,6 +407,62 @@ std::string required_string(const JsonObject& object, const std::string& key) {
     return *value;
 }
 
+struct NullableStringField {
+    bool present = false;
+    std::optional<std::string> value;
+};
+
+NullableStringField nullable_string_field(const JsonObject& object, const std::string& key) {
+    const auto it = object.find(key);
+    if (it == object.end()) {
+        return {};
+    }
+    if (it->second.is_null()) {
+        return {.present = true, .value = std::nullopt};
+    }
+    if (!it->second.is_string()) {
+        throw std::runtime_error("Expected string field: " + key);
+    }
+    return {.present = true, .value = it->second.as_string()};
+}
+
+const JsonObject* optional_object_field(const JsonObject& object, const std::string& key) {
+    const auto it = object.find(key);
+    if (it == object.end() || it->second.is_null()) {
+        return nullptr;
+    }
+    if (!it->second.is_object()) {
+        throw std::runtime_error("Expected object field: " + key);
+    }
+    return &it->second.as_object();
+}
+
+struct AvatarPatch {
+    NullableStringField legacy;
+    NullableStringField preview;
+    NullableStringField full;
+
+    bool any() const {
+        return legacy.present || preview.present || full.present;
+    }
+};
+
+AvatarPatch avatar_patch_from_json(const JsonObject& object) {
+    AvatarPatch patch;
+    patch.legacy = nullable_string_field(object, "avatarObjectId");
+    patch.preview = nullable_string_field(object, "avatarPreviewObjectId");
+    patch.full = nullable_string_field(object, "avatarFullObjectId");
+    if (const auto* avatar = optional_object_field(object, "avatar")) {
+        if (!patch.preview.present) {
+            patch.preview = nullable_string_field(*avatar, "previewObjectId");
+        }
+        if (!patch.full.present) {
+            patch.full = nullable_string_field(*avatar, "fullObjectId");
+        }
+    }
+    return patch;
+}
+
 std::optional<bool> optional_bool(const JsonObject& object, const std::string& key) {
     const auto it = object.find(key);
     if (it == object.end() || it->second.is_null()) {
@@ -527,11 +583,22 @@ struct ProjectionRecord {
     std::string updated_at;
 };
 
+struct ChatPinRecord {
+    std::string user_id;
+    std::string chat_type;
+    std::string chat_id;
+    std::optional<int> sort_order;
+    std::string pinned_at;
+    std::string updated_at;
+};
+
 struct UserProfile {
     std::string user_id;
     std::string display_name;
     std::optional<std::string> username;
     std::optional<std::string> avatar_object_id;
+    std::optional<std::string> avatar_preview_object_id;
+    std::optional<std::string> avatar_full_object_id;
     std::optional<std::string> bio;
     std::optional<std::string> locale;
     std::optional<std::string> time_zone;
@@ -674,6 +741,27 @@ std::vector<std::string> split_string(const std::string& value, const char delim
         }
     }
     return parts;
+}
+
+std::string normalize_chat_pin_type(const std::string& raw_type) {
+    const auto value = to_lower(trim(raw_type));
+    if (value == "direct" || value == "direct_chat" || value == "dm" || value == "private" || value == "personal") {
+        return "direct";
+    }
+    if (value == "group" || value == "group_chat") {
+        return "group";
+    }
+    throw std::runtime_error("Invalid chatType");
+}
+
+void validate_chat_pin_id(const std::string& chat_id) {
+    const auto normalized = trim(chat_id);
+    if (normalized.empty()) {
+        throw std::runtime_error("chatId is required");
+    }
+    if (normalized.size() > 256U) {
+        throw std::runtime_error("chatId is too long");
+    }
 }
 
 std::optional<std::string> counterpart_relationship_status(const std::string& status) {
@@ -1127,8 +1215,8 @@ public:
         const auto result = query_scalar(
             "SELECT COUNT(*)::text FROM information_schema.tables "
             "WHERE table_schema='public' AND table_name IN ("
-            "'user_profiles','user_privacy_settings','user_relationships','user_blocks','user_entity_projection','user_call_history','user_presence_sessions','user_reminders','user_event_outbox');");
-        return result.has_value() && *result == "9";
+            "'user_profiles','user_privacy_settings','user_relationships','user_blocks','user_entity_projection','user_chat_pins','user_call_history','user_presence_sessions','user_reminders','user_event_outbox');");
+        return result.has_value() && *result == "10";
     }
 
     std::optional<JsonObject> get_profile(const std::string& user_id) const {
@@ -1137,6 +1225,7 @@ public:
         }
         const std::string sql =
             "SELECT user_id::text, display_name, COALESCE(username,''), COALESCE(avatar_object_id,''), "
+            "COALESCE(avatar_preview_object_id,''), COALESCE(avatar_full_object_id,''), "
             "COALESCE(bio,''), COALESCE(locale,''), COALESCE(time_zone,''), profile_status, "
             "to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
             "to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
@@ -1147,7 +1236,7 @@ public:
             return std::nullopt;
         }
         const auto& columns = result->front();
-        if (columns.size() != 11U) {
+        if (columns.size() != 13U) {
             throw std::runtime_error("Unexpected profile row shape");
         }
         return JsonObject{
@@ -1155,13 +1244,15 @@ public:
             {"displayName", columns[1]},
             {"username", columns[2].empty() ? Json(nullptr) : Json(columns[2])},
             {"avatarObjectId", columns[3].empty() ? Json(nullptr) : Json(columns[3])},
-            {"bio", columns[4].empty() ? Json(nullptr) : Json(columns[4])},
-            {"locale", columns[5].empty() ? Json(nullptr) : Json(columns[5])},
-            {"timeZone", columns[6].empty() ? Json(nullptr) : Json(columns[6])},
-            {"profileStatus", columns[7]},
-            {"createdAt", columns[8]},
-            {"updatedAt", columns[9]},
-            {"deletedAt", columns[10].empty() ? Json(nullptr) : Json(columns[10])},
+            {"avatarPreviewObjectId", columns[4].empty() ? Json(nullptr) : Json(columns[4])},
+            {"avatarFullObjectId", columns[5].empty() ? Json(nullptr) : Json(columns[5])},
+            {"bio", columns[6].empty() ? Json(nullptr) : Json(columns[6])},
+            {"locale", columns[7].empty() ? Json(nullptr) : Json(columns[7])},
+            {"timeZone", columns[8].empty() ? Json(nullptr) : Json(columns[8])},
+            {"profileStatus", columns[9]},
+            {"createdAt", columns[10]},
+            {"updatedAt", columns[11]},
+            {"deletedAt", columns[12].empty() ? Json(nullptr) : Json(columns[12])},
         };
     }
 
@@ -1192,6 +1283,107 @@ public:
             {"createdAt", columns[6]},
             {"updatedAt", columns[7]},
         };
+    }
+
+    std::vector<ChatPinRecord> list_chat_pins(const std::string& user_id) const {
+        if (!enabled_) {
+            return {};
+        }
+        const std::string sql =
+            "SELECT user_id::text, chat_type, chat_id, COALESCE(sort_order::text,''), "
+            "to_char(pinned_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), "
+            "to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') "
+            "FROM user_chat_pins WHERE user_id='" + shell_escape_single_quotes(user_id) + "' "
+            "ORDER BY sort_order IS NULL, sort_order ASC, pinned_at DESC, chat_type ASC, chat_id ASC;";
+        const auto rows = query_rows(sql);
+        if (!rows.has_value()) {
+            return {};
+        }
+        std::vector<ChatPinRecord> pins;
+        pins.reserve(rows->size());
+        for (const auto& row : *rows) {
+            if (row.size() != 6U) {
+                throw std::runtime_error("Unexpected chat pin row shape");
+            }
+            pins.push_back(ChatPinRecord{
+                .user_id = row[0],
+                .chat_type = row[1],
+                .chat_id = row[2],
+                .sort_order = row[3].empty() ? std::nullopt : std::optional<int>(std::stoi(row[3])),
+                .pinned_at = row[4],
+                .updated_at = row[5],
+            });
+        }
+        return pins;
+    }
+
+    void upsert_chat_pin(const std::string& user_id, const std::string& chat_type, const std::string& chat_id, const std::optional<int>& sort_order) const {
+        if (!enabled_) {
+            return;
+        }
+        const auto now = now_iso8601();
+        const std::string escaped_user_id = shell_escape_single_quotes(user_id);
+        const std::string escaped_chat_type = shell_escape_single_quotes(chat_type);
+        const std::string escaped_chat_id = shell_escape_single_quotes(chat_id);
+        const std::string sort_order_sql = sort_order.has_value() ? std::to_string(*sort_order) : "NULL";
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        sql << "INSERT INTO user_chat_pins (user_id, chat_type, chat_id, sort_order, pinned_at, updated_at) VALUES ('"
+            << escaped_user_id << "','" << escaped_chat_type << "','" << escaped_chat_id << "'," << sort_order_sql << ",NOW(),NOW()) "
+            << "ON CONFLICT (user_id, chat_type, chat_id) DO UPDATE SET "
+            << "sort_order=EXCLUDED.sort_order, updated_at=NOW();";
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ('"
+            << shell_escape_single_quotes(hash_to_uuid("chat-pin-upserted-" + user_id + "-" + chat_type + "-" + chat_id + "-" + now))
+            << "','user_chat_pin','" << escaped_user_id << "','user.chat_pin_upserted','{\"userId\":\""
+            << escaped_user_id << "\",\"chatType\":\"" << escaped_chat_type << "\",\"chatId\":\"" << escaped_chat_id
+            << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
+    }
+
+    bool remove_chat_pin(const std::string& user_id, const std::string& chat_type, const std::string& chat_id) const {
+        if (!enabled_) {
+            return false;
+        }
+        const auto now = now_iso8601();
+        const std::string escaped_user_id = shell_escape_single_quotes(user_id);
+        const std::string escaped_chat_type = shell_escape_single_quotes(chat_type);
+        const std::string escaped_chat_id = shell_escape_single_quotes(chat_id);
+        std::ostringstream sql;
+        sql << "WITH deleted AS ("
+            << "DELETE FROM user_chat_pins WHERE user_id='" << escaped_user_id << "' AND chat_type='" << escaped_chat_type
+            << "' AND chat_id='" << escaped_chat_id << "' RETURNING 1"
+            << "), event_insert AS ("
+            << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) "
+            << "SELECT '" << shell_escape_single_quotes(hash_to_uuid("chat-pin-removed-" + user_id + "-" + chat_type + "-" + chat_id + "-" + now))
+            << "','user_chat_pin','" << escaped_user_id << "','user.chat_pin_removed','{\"userId\":\""
+            << escaped_user_id << "\",\"chatType\":\"" << escaped_chat_type << "\",\"chatId\":\"" << escaped_chat_id
+            << "\"}'::jsonb,NOW(),NULL FROM deleted RETURNING 1"
+            << ") SELECT COUNT(*)::text FROM deleted;";
+        return query_scalar(sql.str()) == std::optional<std::string>("1");
+    }
+
+    void reorder_chat_pins(const std::string& user_id, const std::vector<ChatPinRecord>& pins) const {
+        if (!enabled_ || pins.empty()) {
+            return;
+        }
+        const auto now = now_iso8601();
+        std::ostringstream sql;
+        sql << "BEGIN;";
+        for (const auto& pin : pins) {
+            const std::string sort_order_sql = pin.sort_order.has_value() ? std::to_string(*pin.sort_order) : "NULL";
+            sql << "UPDATE user_chat_pins SET sort_order=" << sort_order_sql << ", updated_at=NOW() "
+                << "WHERE user_id='" << shell_escape_single_quotes(user_id) << "' "
+                << "AND chat_type='" << shell_escape_single_quotes(pin.chat_type) << "' "
+                << "AND chat_id='" << shell_escape_single_quotes(pin.chat_id) << "';";
+        }
+        sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES ('"
+            << shell_escape_single_quotes(hash_to_uuid("chat-pins-reordered-" + user_id + "-" + now))
+            << "','user_chat_pin','" << shell_escape_single_quotes(user_id)
+            << "','user.chat_pins_reordered','{\"userId\":\"" << shell_escape_single_quotes(user_id)
+            << "\"}'::jsonb,NOW(),NULL);";
+        sql << "COMMIT;";
+        exec_sql(sql.str());
     }
 
     void upsert_presence_session(
@@ -1979,8 +2171,8 @@ public:
         const std::string escaped_display_name = shell_escape_single_quotes(display_name);
         const std::string sql =
             "BEGIN;"
-            "INSERT INTO user_profiles (user_id, display_name, username, avatar_object_id, bio, locale, time_zone, profile_status, created_at, updated_at, deleted_at) "
-            "VALUES ('" + escaped_user_id + "','" + escaped_display_name + "',NULL,NULL,NULL,NULL,NULL,'active',NOW(),NOW(),NULL) "
+            "INSERT INTO user_profiles (user_id, display_name, username, avatar_object_id, avatar_preview_object_id, avatar_full_object_id, bio, locale, time_zone, profile_status, created_at, updated_at, deleted_at) "
+            "VALUES ('" + escaped_user_id + "','" + escaped_display_name + "',NULL,NULL,NULL,NULL,NULL,NULL,NULL,'active',NOW(),NOW(),NULL) "
             "ON CONFLICT (user_id) DO NOTHING;"
             "INSERT INTO user_privacy_settings (user_id, profile_visibility, dm_policy, friend_request_policy, last_seen_visibility, avatar_visibility, created_at, updated_at) "
             "VALUES ('" + escaped_user_id + "','public','everyone','everyone','public','public',NOW(),NOW()) "
@@ -2002,8 +2194,8 @@ public:
         const std::string event_id = shell_escape_single_quotes(hash_to_uuid("profile-created-" + user_id + now_iso8601()));
         const std::string sql =
             "WITH inserted_profile AS ("
-            "INSERT INTO user_profiles (user_id, display_name, username, avatar_object_id, bio, locale, time_zone, profile_status, created_at, updated_at, deleted_at) "
-            "VALUES ('" + escaped_user_id + "','" + escaped_display_name + "',NULL,NULL,NULL,NULL,NULL,'" + escaped_profile_status + "',NOW(),NOW(),NULL) "
+            "INSERT INTO user_profiles (user_id, display_name, username, avatar_object_id, avatar_preview_object_id, avatar_full_object_id, bio, locale, time_zone, profile_status, created_at, updated_at, deleted_at) "
+            "VALUES ('" + escaped_user_id + "','" + escaped_display_name + "',NULL,NULL,NULL,NULL,NULL,NULL,NULL,'" + escaped_profile_status + "',NOW(),NOW(),NULL) "
             "ON CONFLICT (user_id) DO NOTHING RETURNING user_id"
             "), privacy_insert AS ("
             "INSERT INTO user_privacy_settings (user_id, profile_visibility, dm_policy, friend_request_policy, last_seen_visibility, avatar_visibility, created_at, updated_at) "
@@ -2033,12 +2225,31 @@ public:
                 assignments.push_back("username='" + shell_escape_single_quotes(required_string(patch, "username")) + "'");
             }
         }
-        if (patch.count("avatarObjectId") != 0) {
-            if (patch.at("avatarObjectId").is_null()) {
-                assignments.push_back("avatar_object_id=NULL");
+        const auto avatar_patch = avatar_patch_from_json(patch);
+        const auto push_nullable_text_assignment = [&assignments](const std::string& column, const std::optional<std::string>& value) {
+            if (value.has_value()) {
+                assignments.push_back(column + "='" + shell_escape_single_quotes(*value) + "'");
             } else {
-                assignments.push_back("avatar_object_id='" + shell_escape_single_quotes(required_string(patch, "avatarObjectId")) + "'");
+                assignments.push_back(column + "=NULL");
             }
+        };
+        if (avatar_patch.legacy.present) {
+            push_nullable_text_assignment("avatar_object_id", avatar_patch.legacy.value);
+            if (!avatar_patch.preview.present) {
+                push_nullable_text_assignment("avatar_preview_object_id", avatar_patch.legacy.value);
+            }
+            if (!avatar_patch.full.present) {
+                push_nullable_text_assignment("avatar_full_object_id", avatar_patch.legacy.value);
+            }
+        }
+        if (avatar_patch.preview.present) {
+            push_nullable_text_assignment("avatar_preview_object_id", avatar_patch.preview.value);
+            if (!avatar_patch.legacy.present) {
+                push_nullable_text_assignment("avatar_object_id", avatar_patch.preview.value);
+            }
+        }
+        if (avatar_patch.full.present) {
+            push_nullable_text_assignment("avatar_full_object_id", avatar_patch.full.value);
         }
         for (const auto field : {"bio", "locale", "timeZone"}) {
             if (patch.count(field) != 0) {
@@ -2068,6 +2279,12 @@ public:
         sql << "'" << shell_escape_single_quotes(hash_to_uuid("profile-updated-" + user_id + now_iso8601())) << "','user_profile','"
             << shell_escape_single_quotes(user_id) << "','user.profile_updated','{\"userId\":\""
             << shell_escape_single_quotes(user_id) << "\"}'::jsonb,NOW(),NULL);";
+        if (avatar_patch.any()) {
+            sql << "INSERT INTO user_event_outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at) VALUES (";
+            sql << "'" << shell_escape_single_quotes(hash_to_uuid("avatar-updated-" + user_id + now_iso8601())) << "','user_profile','"
+                << shell_escape_single_quotes(user_id) << "','user.avatar_updated','{\"userId\":\""
+                << shell_escape_single_quotes(user_id) << "\"}'::jsonb,NOW(),NULL);";
+        }
         sql << "COMMIT;";
         exec_sql(sql.str());
     }
@@ -2578,6 +2795,7 @@ private:
     std::unordered_map<std::string, RelationshipRecord> relationships_;
     std::unordered_map<std::string, BlockRecord> blocks_;
     std::unordered_map<std::string, ProjectionRecord> projections_;
+    std::unordered_map<std::string, ChatPinRecord> chat_pins_;
     std::unordered_map<std::string, CallHistoryRecord> call_history_;
     std::unordered_map<std::string, ReminderRecord> reminders_;
     std::unordered_map<std::string, PresenceSessionRecord> presence_sessions_;
@@ -2918,12 +3136,16 @@ private:
     }
 
     JsonObject internal_profile_contract_from_db_profile(const JsonObject& profile) const {
-        return JsonObject{
+        JsonObject contract{
             {"userId", profile.at("userId")},
             {"displayName", profile.at("displayName")},
             {"avatarObjectId", profile.at("avatarObjectId")},
+            {"avatarPreviewObjectId", profile.at("avatarPreviewObjectId")},
+            {"avatarFullObjectId", profile.at("avatarFullObjectId")},
             {"profileStatus", profile.at("profileStatus")},
         };
+        normalize_avatar_contract(contract);
+        return contract;
     }
 
     JsonObject guest_self_profile_response(const JwtPrincipal& principal) const {
@@ -2933,6 +3155,9 @@ private:
             {"displayName", principal.display_name.value_or("Guest")},
             {"username", Json(nullptr)},
             {"avatarObjectId", Json(nullptr)},
+            {"avatarPreviewObjectId", Json(nullptr)},
+            {"avatarFullObjectId", Json(nullptr)},
+            {"avatar", JsonObject{{"previewObjectId", Json(nullptr)}, {"fullObjectId", Json(nullptr)}}},
             {"bio", Json(nullptr)},
             {"locale", Json(nullptr)},
             {"timeZone", Json(nullptr)},
@@ -2975,9 +3200,11 @@ private:
         if (!profile.has_value()) {
             throw std::runtime_error("Failed to load DB profile after ensure");
         }
-        cache_me_response(actor_user_id, *profile);
+        JsonObject response = *profile;
+        normalize_avatar_contract(response);
+        cache_me_response(actor_user_id, response);
         increment_metric("profile.read.self");
-        return json_response(200, *profile);
+        return json_response(200, response);
     }
 
     Response fast_internal_get_profile(const Request& request) {
@@ -3868,6 +4095,18 @@ private:
         if (request.method == "PATCH" && request.path == "/v1/users/me/privacy") {
             return patch_my_privacy(request);
         }
+        if (request.method == "GET" && request.path == "/v1/users/me/chat-pins") {
+            return list_my_chat_pins(request);
+        }
+        if (request.method == "POST" && request.path == "/v1/users/me/chat-pins") {
+            return upsert_my_chat_pin(request);
+        }
+        if (request.method == "PUT" && request.path == "/v1/users/me/chat-pins/order") {
+            return reorder_my_chat_pins(request);
+        }
+        if (request.method == "DELETE" && (request.path == "/v1/users/me/chat-pins" || starts_with(request.path, "/v1/users/me/chat-pins/"))) {
+            return delete_my_chat_pin(request);
+        }
         if (request.method == "POST" && is_reminder_collection_path(request.path)) {
             return create_my_reminder(request);
         }
@@ -4220,6 +4459,53 @@ private:
         return summary;
     }
 
+    static bool json_has_avatar_value(const JsonObject& object) {
+        for (const auto& key : {"avatarObjectId", "avatarPreviewObjectId", "avatarFullObjectId"}) {
+            const auto it = object.find(key);
+            if (it != object.end() && !it->second.is_null()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static std::optional<std::string> optional_avatar_object_id(const JsonObject& object, const std::string& key) {
+        const auto it = object.find(key);
+        if (it == object.end() || it->second.is_null()) {
+            return std::nullopt;
+        }
+        if (!it->second.is_string()) {
+            throw std::runtime_error("Expected string field: " + key);
+        }
+        return it->second.as_string();
+    }
+
+    static void normalize_avatar_contract(JsonObject& object) {
+        const auto legacy = optional_avatar_object_id(object, "avatarObjectId");
+        const auto preview = optional_avatar_object_id(object, "avatarPreviewObjectId").value_or(
+            legacy.value_or(optional_avatar_object_id(object, "avatarFullObjectId").value_or("")));
+        const auto full = optional_avatar_object_id(object, "avatarFullObjectId").value_or(
+            legacy.value_or(optional_avatar_object_id(object, "avatarPreviewObjectId").value_or("")));
+
+        object["avatarPreviewObjectId"] = preview.empty() ? Json(nullptr) : Json(preview);
+        object["avatarFullObjectId"] = full.empty() ? Json(nullptr) : Json(full);
+        object["avatarObjectId"] = preview.empty() ? Json(nullptr) : Json(preview);
+        object["avatar"] = JsonObject{
+            {"previewObjectId", preview.empty() ? Json(nullptr) : Json(preview)},
+            {"fullObjectId", full.empty() ? Json(nullptr) : Json(full)},
+        };
+    }
+
+    static void mask_avatar_contract(JsonObject& object) {
+        object["avatarObjectId"] = Json(nullptr);
+        object["avatarPreviewObjectId"] = Json(nullptr);
+        object["avatarFullObjectId"] = Json(nullptr);
+        object["avatar"] = JsonObject{
+            {"previewObjectId", Json(nullptr)},
+            {"fullObjectId", Json(nullptr)},
+        };
+    }
+
     JsonObject raw_profile_to_json(const UserProfile& profile) const {
         return JsonObject{
             {"userId", profile.user_id},
@@ -4243,7 +4529,8 @@ private:
         const std::string profile_status = required_string(object, "profileStatus");
         const std::string resolved_profile_visibility = profile_visibility.value_or("-");
         const std::string resolved_avatar_visibility = avatar_visibility.value_or("-");
-        const bool avatar_object_present = object.count("avatarObjectId") != 0 && !object.at("avatarObjectId").is_null();
+        normalize_avatar_contract(object);
+        const bool avatar_object_present = json_has_avatar_value(object);
 
         bool avatar_allowed = include_private_fields;
         std::string avatar_reason = include_private_fields ? "private_fields_included" : "avatar_available";
@@ -4265,9 +4552,9 @@ private:
 
         const bool mask_applied = avatar_object_present && !avatar_allowed;
         if (mask_applied) {
-            object["avatarObjectId"] = Json(nullptr);
+            mask_avatar_contract(object);
         }
-        const bool avatar_object_exposed = object.count("avatarObjectId") != 0 && !object.at("avatarObjectId").is_null();
+        const bool avatar_object_exposed = json_has_avatar_value(object);
 
         log_profile_resolution(
             "200",
@@ -4319,6 +4606,8 @@ private:
         object["locale"] = profile.locale.has_value() ? Json(*profile.locale) : Json(nullptr);
         object["timeZone"] = profile.time_zone.has_value() ? Json(*profile.time_zone) : Json(nullptr);
         object["avatarObjectId"] = profile.avatar_object_id.has_value() ? Json(*profile.avatar_object_id) : Json(nullptr);
+        object["avatarPreviewObjectId"] = profile.avatar_preview_object_id.has_value() ? Json(*profile.avatar_preview_object_id) : Json(nullptr);
+        object["avatarFullObjectId"] = profile.avatar_full_object_id.has_value() ? Json(*profile.avatar_full_object_id) : Json(nullptr);
         object["deletedAt"] = profile.deleted_at.has_value() ? Json(*profile.deleted_at) : Json(nullptr);
         return profile_to_json(
             std::move(object),
@@ -4349,21 +4638,29 @@ private:
         for (const auto& participant_user_id : record.participant_user_ids) {
             if (db_.enabled()) {
                 const auto& profile = ensure_db_profile_exists_and_load(participant_user_id, std::nullopt);
-                participants.emplace_back(JsonObject{
+                JsonObject participant{
                     {"userId", required_string(profile, "userId")},
                     {"displayName", required_string(profile, "displayName")},
                     {"avatarObjectId", profile.at("avatarObjectId")},
+                    {"avatarPreviewObjectId", profile.at("avatarPreviewObjectId")},
+                    {"avatarFullObjectId", profile.at("avatarFullObjectId")},
                     {"profileStatus", required_string(profile, "profileStatus")},
-                });
+                };
+                normalize_avatar_contract(participant);
+                participants.emplace_back(std::move(participant));
                 continue;
             }
             const auto& profile = require_profile_const(participant_user_id);
-            participants.emplace_back(JsonObject{
+            JsonObject participant{
                 {"userId", profile.user_id},
                 {"displayName", profile.display_name},
                 {"avatarObjectId", profile.avatar_object_id.has_value() ? Json(*profile.avatar_object_id) : Json(nullptr)},
+                {"avatarPreviewObjectId", profile.avatar_preview_object_id.has_value() ? Json(*profile.avatar_preview_object_id) : Json(nullptr)},
+                {"avatarFullObjectId", profile.avatar_full_object_id.has_value() ? Json(*profile.avatar_full_object_id) : Json(nullptr)},
                 {"profileStatus", profile.profile_status},
-            });
+            };
+            normalize_avatar_contract(participant);
+            participants.emplace_back(std::move(participant));
         }
         return JsonObject{
             {"historyId", record.history_id},
@@ -5470,19 +5767,29 @@ private:
     }
 
     JsonObject internal_profile_contract_json(const JsonObject& profile) const {
-        return JsonObject{
+        JsonObject contract{
             {"userId", required_string(profile, "userId")},
             {"displayName", required_string(profile, "displayName")},
+            {"avatarObjectId", profile.at("avatarObjectId")},
+            {"avatarPreviewObjectId", profile.at("avatarPreviewObjectId")},
+            {"avatarFullObjectId", profile.at("avatarFullObjectId")},
             {"profileStatus", required_string(profile, "profileStatus")},
         };
+        normalize_avatar_contract(contract);
+        return contract;
     }
 
     JsonObject internal_profile_contract_json(const UserProfile& profile) const {
-        return JsonObject{
+        JsonObject contract{
             {"userId", profile.user_id},
             {"displayName", profile.display_name},
+            {"avatarObjectId", profile.avatar_object_id.has_value() ? Json(*profile.avatar_object_id) : Json(nullptr)},
+            {"avatarPreviewObjectId", profile.avatar_preview_object_id.has_value() ? Json(*profile.avatar_preview_object_id) : Json(nullptr)},
+            {"avatarFullObjectId", profile.avatar_full_object_id.has_value() ? Json(*profile.avatar_full_object_id) : Json(nullptr)},
             {"profileStatus", profile.profile_status},
         };
+        normalize_avatar_contract(contract);
+        return contract;
     }
 
     Response internal_batch_profiles(const Request& request) {
@@ -5561,6 +5868,9 @@ private:
                 {"userId", resolved.at("userId")},
                 {"displayName", resolved.at("displayName")},
                 {"avatarObjectId", resolved.at("avatarObjectId")},
+                {"avatarPreviewObjectId", resolved.at("avatarPreviewObjectId")},
+                {"avatarFullObjectId", resolved.at("avatarFullObjectId")},
+                {"avatar", resolved.at("avatar")},
                 {"profileStatus", resolved.at("profileStatus")},
             });
         }
@@ -5571,6 +5881,9 @@ private:
             {"userId", resolved.at("userId")},
             {"displayName", resolved.at("displayName")},
             {"avatarObjectId", resolved.at("avatarObjectId")},
+            {"avatarPreviewObjectId", resolved.at("avatarPreviewObjectId")},
+            {"avatarFullObjectId", resolved.at("avatarFullObjectId")},
+            {"avatar", resolved.at("avatar")},
             {"profileStatus", resolved.at("profileStatus")},
         });
     }
@@ -5859,6 +6172,9 @@ private:
             db_.ensure_profile_exists(actor_user_id, preferred_display_name.value_or("User " + actor_user_id.substr(0, std::min<std::size_t>(8, actor_user_id.size()))));
             db_.patch_profile(actor_user_id, object);
             increment_metric("profile.updated");
+            if (avatar_patch_from_json(object).any()) {
+                increment_metric("profile.avatar_updated");
+            }
             audit("profile.update", actor_user_id, actor_user_id);
             invalidate_user_cache(actor_user_id);
             const auto& profile = ensure_db_profile_exists_and_load(actor_user_id, preferred_display_name);
@@ -5885,15 +6201,40 @@ private:
         } else if (object.count("username") != 0 && object.at("username").is_null()) {
             profile.username = std::nullopt;
         }
-        profile.avatar_object_id = optional_string(object, "avatarObjectId");
-        profile.bio = optional_string(object, "bio");
-        profile.locale = optional_string(object, "locale");
-        profile.time_zone = optional_string(object, "timeZone");
+        const auto avatar_patch = avatar_patch_from_json(object);
+        if (avatar_patch.legacy.present) {
+            profile.avatar_object_id = avatar_patch.legacy.value;
+            if (!avatar_patch.preview.present) {
+                profile.avatar_preview_object_id = avatar_patch.legacy.value;
+            }
+            if (!avatar_patch.full.present) {
+                profile.avatar_full_object_id = avatar_patch.legacy.value;
+            }
+        }
+        if (avatar_patch.preview.present) {
+            profile.avatar_preview_object_id = avatar_patch.preview.value;
+            if (!avatar_patch.legacy.present) {
+                profile.avatar_object_id = avatar_patch.preview.value;
+            }
+        }
+        if (avatar_patch.full.present) {
+            profile.avatar_full_object_id = avatar_patch.full.value;
+        }
+        const auto apply_nullable_profile_field = [&object](const std::string& key, std::optional<std::string>& target) {
+            const auto value = nullable_string_field(object, key);
+            if (value.present) {
+                target = value.value;
+            }
+        };
+        apply_nullable_profile_field("bio", profile.bio);
+        apply_nullable_profile_field("locale", profile.locale);
+        apply_nullable_profile_field("timeZone", profile.time_zone);
         profile.updated_at = now_iso8601();
 
         publish_event("user.profile_updated", JsonObject{{"userId", actor_user_id}});
-        if (object.count("avatarObjectId") != 0) {
-        publish_event("user.avatar_updated", JsonObject{{"userId", actor_user_id}});
+        if (avatar_patch.any()) {
+            publish_event("user.avatar_updated", JsonObject{{"userId", actor_user_id}});
+            increment_metric("profile.avatar_updated");
         }
         audit("profile.update", actor_user_id, actor_user_id);
         increment_metric("profile.updated");
@@ -6235,6 +6576,192 @@ private:
         audit("block.remove", actor_user_id, target_user_id);
         increment_metric("block.removed");
         return json_response(200, JsonObject{{"status", "unblocked"}, {"targetUserId", target_user_id}});
+    }
+
+    static std::string chat_pin_key(const std::string& user_id, const std::string& chat_type, const std::string& chat_id) {
+        return user_id + "|" + chat_type + "|" + chat_id;
+    }
+
+    static JsonObject chat_pin_to_json(const ChatPinRecord& pin) {
+        return JsonObject{
+            {"chatType", pin.chat_type},
+            {"chatId", pin.chat_id},
+            {"sortOrder", pin.sort_order.has_value() ? Json(*pin.sort_order) : Json(nullptr)},
+            {"pinnedAt", pin.pinned_at},
+            {"updatedAt", pin.updated_at},
+        };
+    }
+
+    static bool chat_pin_less(const ChatPinRecord& lhs, const ChatPinRecord& rhs) {
+        if (lhs.sort_order.has_value() != rhs.sort_order.has_value()) {
+            return lhs.sort_order.has_value();
+        }
+        if (lhs.sort_order.has_value() && rhs.sort_order.has_value() && *lhs.sort_order != *rhs.sort_order) {
+            return *lhs.sort_order < *rhs.sort_order;
+        }
+        if (lhs.pinned_at != rhs.pinned_at) {
+            return lhs.pinned_at > rhs.pinned_at;
+        }
+        if (lhs.chat_type != rhs.chat_type) {
+            return lhs.chat_type < rhs.chat_type;
+        }
+        return lhs.chat_id < rhs.chat_id;
+    }
+
+    ChatPinRecord chat_pin_from_request(const JsonObject& object, const std::string& actor_user_id, const std::optional<int>& fallback_sort_order = std::nullopt) const {
+        const std::string chat_type = normalize_chat_pin_type(optional_string(object, "chatType").value_or(optional_string(object, "targetType").value_or("")));
+        const std::string chat_id = trim(optional_string(object, "chatId").value_or(optional_string(object, "targetId").value_or("")));
+        validate_chat_pin_id(chat_id);
+        std::optional<int> sort_order = fallback_sort_order;
+        if (const auto value = optional_int64(object, "sortOrder")) {
+            sort_order = static_cast<int>(*value);
+        }
+        const auto now = now_iso8601();
+        return ChatPinRecord{
+            .user_id = actor_user_id,
+            .chat_type = chat_type,
+            .chat_id = chat_id,
+            .sort_order = sort_order,
+            .pinned_at = now,
+            .updated_at = now,
+        };
+    }
+
+    Response list_my_chat_pins(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+
+        JsonArray items;
+        if (db_.enabled()) {
+            for (const auto& pin : db_.list_chat_pins(actor_user_id)) {
+                items.emplace_back(chat_pin_to_json(pin));
+            }
+        } else {
+            std::vector<ChatPinRecord> pins;
+            for (const auto& [key, pin] : chat_pins_) {
+                if (pin.user_id == actor_user_id) {
+                    pins.push_back(pin);
+                }
+            }
+            std::sort(pins.begin(), pins.end(), chat_pin_less);
+            for (const auto& pin : pins) {
+                items.emplace_back(chat_pin_to_json(pin));
+            }
+        }
+        increment_metric("chat_pin.list");
+        return json_response(200, JsonObject{{"items", items}});
+    }
+
+    Response upsert_my_chat_pin(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        const auto pin = chat_pin_from_request(object, actor_user_id);
+        ChatPinRecord response_pin = pin;
+
+        if (db_.enabled()) {
+            db_.upsert_chat_pin(actor_user_id, pin.chat_type, pin.chat_id, pin.sort_order);
+            for (const auto& stored_pin : db_.list_chat_pins(actor_user_id)) {
+                if (stored_pin.chat_type == pin.chat_type && stored_pin.chat_id == pin.chat_id) {
+                    response_pin = stored_pin;
+                    break;
+                }
+            }
+        } else {
+            const auto key = chat_pin_key(actor_user_id, pin.chat_type, pin.chat_id);
+            auto stored = pin;
+            if (const auto existing = chat_pins_.find(key); existing != chat_pins_.end()) {
+                stored.pinned_at = existing->second.pinned_at;
+            }
+            chat_pins_[key] = stored;
+            response_pin = stored;
+            publish_event("user.chat_pin_upserted", JsonObject{{"userId", actor_user_id}, {"chatType", pin.chat_type}, {"chatId", pin.chat_id}});
+        }
+        audit("chat_pin.upsert", actor_user_id, actor_user_id, JsonObject{{"chatType", pin.chat_type}, {"chatId", pin.chat_id}});
+        increment_metric("chat_pin.upserted");
+        return json_response(200, JsonObject{{"ok", true}, {"pin", chat_pin_to_json(response_pin)}});
+    }
+
+    std::pair<std::string, std::string> chat_pin_target_from_delete_request(const Request& request) const {
+        const auto segments = split_path(request.path);
+        if (segments.size() == 5 && segments[0] == "v1" && segments[1] == "users" && segments[2] == "me" && segments[3] == "chat-pins") {
+            const std::string chat_type = normalize_chat_pin_type(segments[4]);
+            const std::string chat_id = trim(optional_string(require_object(JsonParser(request.body).parse()), "chatId").value_or(""));
+            validate_chat_pin_id(chat_id);
+            return {chat_type, chat_id};
+        }
+        if (segments.size() == 6 && segments[0] == "v1" && segments[1] == "users" && segments[2] == "me" && segments[3] == "chat-pins") {
+            const std::string chat_type = normalize_chat_pin_type(segments[4]);
+            const std::string chat_id = trim(segments[5]);
+            validate_chat_pin_id(chat_id);
+            return {chat_type, chat_id};
+        }
+        if (request.path == "/v1/users/me/chat-pins") {
+            const auto body = JsonParser(request.body).parse();
+            const auto& object = require_object(body);
+            const std::string chat_type = normalize_chat_pin_type(optional_string(object, "chatType").value_or(optional_string(object, "targetType").value_or("")));
+            const std::string chat_id = trim(optional_string(object, "chatId").value_or(optional_string(object, "targetId").value_or("")));
+            validate_chat_pin_id(chat_id);
+            return {chat_type, chat_id};
+        }
+        throw HttpError(404, "not_found", "Route not found");
+    }
+
+    Response delete_my_chat_pin(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const auto [chat_type, chat_id] = chat_pin_target_from_delete_request(request);
+
+        bool removed = false;
+        if (db_.enabled()) {
+            removed = db_.remove_chat_pin(actor_user_id, chat_type, chat_id);
+        } else {
+            removed = chat_pins_.erase(chat_pin_key(actor_user_id, chat_type, chat_id)) > 0U;
+            if (removed) {
+                publish_event("user.chat_pin_removed", JsonObject{{"userId", actor_user_id}, {"chatType", chat_type}, {"chatId", chat_id}});
+            }
+        }
+        audit("chat_pin.remove", actor_user_id, actor_user_id, JsonObject{{"chatType", chat_type}, {"chatId", chat_id}});
+        increment_metric(removed ? "chat_pin.removed" : "chat_pin.remove_missing");
+        return json_response(200, JsonObject{{"ok", true}, {"removed", removed}, {"chatType", chat_type}, {"chatId", chat_id}});
+    }
+
+    Response reorder_my_chat_pins(const Request& request) {
+        const auto actor_user_id = require_actor_user_id(request);
+        ensure_profile_exists(actor_user_id);
+        const auto body = JsonParser(request.body).parse();
+        const auto& object = require_object(body);
+        const auto items_it = object.find("items");
+        if (items_it == object.end() || !items_it->second.is_array()) {
+            throw std::runtime_error("Expected array field: items");
+        }
+
+        std::vector<ChatPinRecord> pins;
+        int index = 0;
+        for (const auto& item : items_it->second.as_array()) {
+            const auto& item_object = require_object(item);
+            pins.push_back(chat_pin_from_request(item_object, actor_user_id, index));
+            ++index;
+        }
+
+        if (db_.enabled()) {
+            db_.reorder_chat_pins(actor_user_id, pins);
+        } else {
+            for (const auto& pin : pins) {
+                const auto key = chat_pin_key(actor_user_id, pin.chat_type, pin.chat_id);
+                const auto existing = chat_pins_.find(key);
+                if (existing == chat_pins_.end()) {
+                    continue;
+                }
+                existing->second.sort_order = pin.sort_order;
+                existing->second.updated_at = now_iso8601();
+            }
+            publish_event("user.chat_pins_reordered", JsonObject{{"userId", actor_user_id}});
+        }
+        audit("chat_pin.reorder", actor_user_id, actor_user_id);
+        increment_metric("chat_pin.reordered");
+        return list_my_chat_pins(request);
     }
 
     Response list_projection_entities(const Request& request, const std::string& entity_type) {
