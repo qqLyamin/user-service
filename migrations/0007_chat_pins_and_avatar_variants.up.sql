@@ -26,4 +26,4 @@ ALTER TABLE user_event_outbox
 
 ALTER TABLE user_event_outbox
     ADD CONSTRAINT user_event_outbox_aggregate_type_chk
-        CHECK (aggregate_type IN ('user_profile', 'user_privacy', 'user_relationship', 'user_block', 'user_projection', 'user_chat_pin'));
+        CHECK (aggregate_type IN ('user_profile', 'user_privacy', 'user_relationship', 'user_block', 'user_projection', 'user_call_history', 'user_chat_pin'));
