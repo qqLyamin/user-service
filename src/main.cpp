@@ -1424,10 +1424,15 @@ public:
         return rows.has_value() && !rows->empty();
     }
 
-    std::vector<PresenceSnapshot> list_presence(const std::vector<std::string>& user_ids, const int green_ttl_seconds) const {
+    std::vector<PresenceSnapshot> list_presence(
+        const std::vector<std::string>& user_ids,
+        const int green_ttl_seconds,
+        const int stale_ttl_seconds) const {
         if (!enabled_ || user_ids.empty()) {
             return {};
         }
+        const int green_ttl = std::max(green_ttl_seconds, 1);
+        const int stale_ttl = std::max(stale_ttl_seconds, green_ttl);
         std::ostringstream in_clause;
         for (std::size_t i = 0; i < user_ids.size(); ++i) {
             if (i != 0U) {
@@ -1438,13 +1443,13 @@ public:
         std::ostringstream sql;
         sql << "SELECT user_id::text, "
             << "CASE "
-            << "WHEN COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << std::max(green_ttl_seconds, 1) << " seconds') > 0 THEN 'green' "
-            << "WHEN COUNT(*) FILTER (WHERE state='connected') > 0 THEN 'yellow' "
+            << "WHEN COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << green_ttl << " seconds') > 0 THEN 'green' "
+            << "WHEN COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << stale_ttl << " seconds') > 0 THEN 'yellow' "
             << "ELSE 'red' END, "
-            << "CASE WHEN COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << std::max(green_ttl_seconds, 1) << " seconds') > 0 THEN 'true' ELSE 'false' END, "
+            << "CASE WHEN COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << green_ttl << " seconds') > 0 THEN 'true' ELSE 'false' END, "
             << "COALESCE(to_char(MAX(COALESCE(last_disconnect_at, last_pulse_at)) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),''), "
-            << "COUNT(*) FILTER (WHERE state='connected')::text, "
-            << "COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << std::max(green_ttl_seconds, 1) << " seconds')::text "
+            << "COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << stale_ttl << " seconds')::text, "
+            << "COUNT(*) FILTER (WHERE state='connected' AND last_pulse_at >= NOW() - INTERVAL '" << green_ttl << " seconds')::text "
             << "FROM user_presence_sessions WHERE user_id IN (" << in_clause.str() << ") "
             << "GROUP BY user_id;";
         const auto rows = query_rows(sql.str());
@@ -2784,9 +2789,10 @@ private:
     int health_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_HEALTH_CACHE_TTL_SECONDS", 5);
     int me_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_ME_CACHE_TTL_SECONDS", 10);
     int internal_profile_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_INTERNAL_PROFILE_CACHE_TTL_SECONDS", 30);
+    int presence_ttl_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_TTL_SECONDS", 60);
+    int presence_stale_ttl_seconds_ = parse_int_env("PRESENCE_STALE_TTL_SECONDS", presence_ttl_seconds_);
     bool presence_async_db_flush_ = parse_bool_env("USER_SERVICE_PRESENCE_ASYNC_DB_FLUSH", true);
     int presence_db_debounce_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_DB_DEBOUNCE_SECONDS", 20);
-    int presence_ttl_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_TTL_SECONDS", 60);
     int presence_flush_interval_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_FLUSH_INTERVAL_SECONDS", 5);
     int presence_flush_batch_size_ = parse_int_env("USER_SERVICE_PRESENCE_FLUSH_BATCH_SIZE", 512);
     int presence_flush_failure_backoff_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_FLUSH_FAILURE_BACKOFF_SECONDS", 30);
@@ -2837,6 +2843,7 @@ private:
         std::string session_id;
         std::optional<std::string> device_id;
         std::string platform;
+        Clock::time_point last_pulse_at;
         Clock::time_point last_db_write_at;
         Clock::time_point next_flush_attempt_at;
         Clock::time_point expires_at;
@@ -3296,7 +3303,10 @@ private:
             }
         }
 
-        const auto snapshots = db_.list_presence(normalized_user_ids, presence_green_ttl_seconds_);
+        const auto snapshots = db_.list_presence(
+            normalized_user_ids,
+            presence_green_ttl_seconds_,
+            presence_stale_ttl_seconds_);
         std::unordered_map<std::string, PresenceSnapshot> by_user_id;
         for (const auto& snapshot : snapshots) {
             by_user_id[snapshot.user_id] = snapshot;
@@ -3318,17 +3328,32 @@ private:
 
     void overlay_pending_presence(std::unordered_map<std::string, PresenceSnapshot>& by_user_id) const {
         const auto now = Clock::now();
+        const int green_ttl_seconds = std::max(presence_green_ttl_seconds_, 1);
+        const int stale_ttl_seconds = std::max(presence_stale_ttl_seconds_, green_ttl_seconds);
+        const auto green_ttl = std::chrono::seconds(green_ttl_seconds);
+        const auto stale_ttl = std::chrono::seconds(stale_ttl_seconds);
         std::lock_guard<std::mutex> guard(presence_cache_mutex_);
         for (const auto& [key, session] : pending_presence_writes_) {
             if (now >= session.expires_at) {
                 continue;
             }
+            const auto pulse_age = now - session.last_pulse_at;
+            if (pulse_age > stale_ttl) {
+                continue;
+            }
+            const bool recent = pulse_age <= green_ttl;
             auto& snapshot = by_user_id[session.user_id];
             snapshot.user_id = session.user_id;
-            snapshot.presence = "green";
-            snapshot.is_online = true;
+            if (recent) {
+                snapshot.presence = "green";
+                snapshot.is_online = true;
+            } else if (snapshot.presence != "green") {
+                snapshot.presence = "yellow";
+            }
             snapshot.connected_session_count = std::max(snapshot.connected_session_count, 0) + 1;
-            snapshot.recent_session_count = std::max(snapshot.recent_session_count, 0) + 1;
+            if (recent) {
+                snapshot.recent_session_count = std::max(snapshot.recent_session_count, 0) + 1;
+            }
         }
     }
 
@@ -3352,7 +3377,10 @@ private:
         }
         entry.device_id = device_id;
         entry.platform = platform;
-        entry.expires_at = now + std::chrono::seconds(std::max(presence_ttl_seconds_, 1));
+        entry.last_pulse_at = now;
+        const int green_ttl_seconds = std::max(presence_green_ttl_seconds_, 1);
+        const int stale_ttl_seconds = std::max(presence_stale_ttl_seconds_, green_ttl_seconds);
+        entry.expires_at = now + std::chrono::seconds(stale_ttl_seconds);
         if (!persist_to_db) {
             entry.dirty = false;
             return false;
@@ -5131,6 +5159,8 @@ private:
     std::vector<PresenceSnapshot> list_memory_presence(const std::vector<std::string>& user_ids) const {
         std::vector<PresenceSnapshot> items;
         const auto now_seconds = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();
+        const int green_ttl = std::max(presence_green_ttl_seconds_, 1);
+        const int stale_ttl = std::max(presence_stale_ttl_seconds_, green_ttl);
         for (const auto& user_id : user_ids) {
             int connected_session_count = 0;
             int recent_session_count = 0;
@@ -5151,8 +5181,11 @@ private:
                     last_seen_at = session_last_seen_at;
                 }
                 if (session.state == "connected") {
-                    ++connected_session_count;
-                    if ((now_seconds - session.last_pulse_epoch_seconds) <= presence_green_ttl_seconds_) {
+                    const auto pulse_age_seconds = now_seconds - session.last_pulse_epoch_seconds;
+                    if (pulse_age_seconds <= stale_ttl) {
+                        ++connected_session_count;
+                    }
+                    if (pulse_age_seconds <= green_ttl) {
                         ++recent_session_count;
                     }
                 }
@@ -6882,7 +6915,10 @@ private:
             }
         }
         std::vector<PresenceSnapshot> snapshots = db_.enabled()
-            ? db_.list_presence(normalized_user_ids, presence_green_ttl_seconds_)
+            ? db_.list_presence(
+                normalized_user_ids,
+                presence_green_ttl_seconds_,
+                presence_stale_ttl_seconds_)
             : list_memory_presence(normalized_user_ids);
         std::unordered_map<std::string, PresenceSnapshot> by_user_id;
         for (const auto& snapshot : snapshots) {

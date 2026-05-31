@@ -313,10 +313,13 @@ Notes:
 Presence is aggregated per user across client sessions:
 
 - `green`: there is at least one connected session with a recent pulse
-- `yellow`: there is at least one connected session, but no recent pulse
-- `red`: all known sessions are explicitly disconnected, or no presence session exists
+- `yellow`: there is at least one connected session whose pulse is stale for green, but still inside the away window
+- `red`: no presence session exists, all known sessions are explicitly disconnected, or every connected session is stale beyond the away window
 
 The recent pulse threshold defaults to `30` seconds and can be overridden with `PRESENCE_GREEN_TTL_SECONDS`.
+The away/stale threshold defaults to `USER_SERVICE_PRESENCE_TTL_SECONDS` (`60` seconds by default) and can be overridden
+with `PRESENCE_STALE_TTL_SECONDS`. If the stale threshold is configured lower than the green threshold, the service
+clamps it to the green threshold.
 
 Client pulse:
 

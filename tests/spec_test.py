@@ -134,6 +134,7 @@ def main() -> int:
     env["JWT_AUDIENCE"] = INTERNAL_JWT_AUDIENCE
     env["INTERNAL_TOKEN"] = INTERNAL_JWT_SECRET
     env["PRESENCE_GREEN_TTL_SECONDS"] = "1"
+    env["USER_SERVICE_PRESENCE_TTL_SECONDS"] = "3"
     env["REMINDER_SCAN_INTERVAL_SECONDS"] = "1"
     proc = subprocess.Popen([str(EXE)], cwd=str(ROOT), env=env)
     try:
@@ -301,6 +302,15 @@ def main() -> int:
         yellow_presence = request("POST", "/v1/users/presence/query", {"userIds": [alice]}, user_id=bob)
         assert yellow_presence["items"][0]["presence"] == "yellow"
         assert yellow_presence["items"][0]["isOnline"] is False
+        assert yellow_presence["items"][0]["connectedSessionCount"] == 1
+        assert yellow_presence["items"][0]["recentSessionCount"] == 0
+
+        time.sleep(1.4)
+        stale_presence = request("POST", "/v1/users/presence/query", {"userIds": [alice]}, user_id=bob)
+        assert stale_presence["items"][0]["presence"] == "red"
+        assert stale_presence["items"][0]["isOnline"] is False
+        assert stale_presence["items"][0]["connectedSessionCount"] == 0
+        assert stale_presence["items"][0]["recentSessionCount"] == 0
 
         disconnect_presence = request("POST", "/v1/users/me/presence/disconnect", {
             "sessionId": "alice-desktop",
