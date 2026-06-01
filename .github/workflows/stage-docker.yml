@@ -26,6 +26,8 @@ env:
   POSTGRES_SSLMODE: ${{ vars.POSTGRES_SSLMODE || 'disable' }}
   JWT_ISSUER: ${{ vars.JWT_ISSUER || 'auth-service' }}
   JWT_AUDIENCE: ${{ vars.JWT_AUDIENCE || 'internal' }}
+  MEDIA_SERVICE_BASE_URL: ${{ vars.MEDIA_SERVICE_BASE_URL || 'http://127.0.0.1:8830' }}
+  USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS: ${{ vars.USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS || '800' }}
 
 jobs:
   test-build-push-deploy:
@@ -139,6 +141,9 @@ jobs:
             JWT_ISSUER=${{ env.JWT_ISSUER }}
             JWT_AUDIENCE=${{ env.JWT_AUDIENCE }}
             INTERNAL_TOKEN=${USER_SERVICE_SECRET}
+            MEDIA_SERVICE_BASE_URL=${{ env.MEDIA_SERVICE_BASE_URL }}
+            USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS=${{ env.USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS }}
+            USER_SERVICE_AVATAR_CLEANUP_ENABLED=true
             EOF
             sed -i 's/^            //' "$env_file"
 

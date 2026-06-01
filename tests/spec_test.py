@@ -7,9 +7,11 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 
@@ -123,9 +125,48 @@ def post_event(event_type: str, event_id: str, payload: dict, expected_status=20
     )
 
 
+class FakeMediaHandler(BaseHTTPRequestHandler):
+    def do_DELETE(self):
+        self.server.deleted.append((self.path, self.headers.get("Authorization", "")))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+    def log_message(self, _format, *_args):
+        return
+
+
+def wait_for_media_deletes(media_server, expected_paths, timeout=5.0):
+    deadline = time.time() + timeout
+    expected = set(expected_paths)
+    while time.time() < deadline:
+        seen = {path for path, _auth in media_server.deleted}
+        if expected.issubset(seen):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"expected media deletes {expected}, got {media_server.deleted}")
+
+
+def wait_for_presence(target_user_id, requester_user_id, expected_presence, timeout=5.0):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = request("POST", "/v1/users/presence/query", {"userIds": [target_user_id]}, user_id=requester_user_id)
+        if last["items"][0]["presence"] == expected_presence:
+            return last
+        time.sleep(0.1)
+    raise AssertionError(f"expected presence {expected_presence}, got {last}")
+
+
 def main() -> int:
     if not EXE.exists():
         raise RuntimeError(f"binary not found: {EXE}")
+
+    media_server = HTTPServer(("127.0.0.1", 0), FakeMediaHandler)
+    media_server.deleted = []
+    media_thread = threading.Thread(target=media_server.serve_forever, daemon=True)
+    media_thread.start()
 
     env = os.environ.copy()
     env["USER_SERVICE_PORT"] = "18080"
@@ -136,6 +177,8 @@ def main() -> int:
     env["PRESENCE_GREEN_TTL_SECONDS"] = "1"
     env["USER_SERVICE_PRESENCE_TTL_SECONDS"] = "3"
     env["REMINDER_SCAN_INTERVAL_SECONDS"] = "1"
+    env["MEDIA_SERVICE_BASE_URL"] = f"http://127.0.0.1:{media_server.server_address[1]}"
+    env["USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS"] = "500"
     proc = subprocess.Popen([str(EXE)], cwd=str(ROOT), env=env)
     try:
         wait_for_port("127.0.0.1", 18080)
@@ -306,7 +349,7 @@ def main() -> int:
         assert yellow_presence["items"][0]["recentSessionCount"] == 0
 
         time.sleep(1.4)
-        stale_presence = request("POST", "/v1/users/presence/query", {"userIds": [alice]}, user_id=bob)
+        stale_presence = wait_for_presence(alice, bob, "red")
         assert stale_presence["items"][0]["presence"] == "red"
         assert stale_presence["items"][0]["isOnline"] is False
         assert stale_presence["items"][0]["connectedSessionCount"] == 0
@@ -365,20 +408,36 @@ def main() -> int:
         assert patched["avatar"]["previewObjectId"] == "obj_avatar_alice_preview"
         assert patched["avatar"]["fullObjectId"] == "obj_avatar_alice_full"
 
+        repatched = request("PATCH", "/v1/users/me", {
+            "avatarPreviewObjectId": "obj_avatar_alice_preview_new",
+            "avatarFullObjectId": "obj_avatar_alice_full_new",
+        }, user_id=alice)
+        assert repatched["avatarObjectId"] == "obj_avatar_alice_preview_new"
+        assert repatched["avatarPreviewObjectId"] == "obj_avatar_alice_preview_new"
+        assert repatched["avatarFullObjectId"] == "obj_avatar_alice_full_new"
+        wait_for_media_deletes(media_server, {
+            "/file/obj_avatar_alice_preview",
+            "/file/obj_avatar_alice_full",
+        })
+        deleted_paths = [path for path, _auth in media_server.deleted]
+        assert "/file/obj_avatar_alice_preview_new" not in deleted_paths
+        assert "/file/obj_avatar_alice_full_new" not in deleted_paths
+        assert all(auth.startswith("Bearer ") for _path, auth in media_server.deleted)
+
         alice_privacy = request("PATCH", "/v1/users/me/privacy", {
             "avatarVisibility": "public",
         }, user_id=alice)
         assert alice_privacy["avatarVisibility"] == "public"
 
         alice_internal_profile = request("GET", f"/internal/users/{alice}/profile", internal=True)
-        assert alice_internal_profile["avatarObjectId"] == "obj_avatar_alice_preview"
-        assert alice_internal_profile["avatar"]["fullObjectId"] == "obj_avatar_alice_full"
+        assert alice_internal_profile["avatarObjectId"] == "obj_avatar_alice_preview_new"
+        assert alice_internal_profile["avatar"]["fullObjectId"] == "obj_avatar_alice_full_new"
 
         batch_profiles = request("POST", "/internal/users/batch", {"userIds": [alice, bob, alice.upper()]}, internal=True)
         assert len(batch_profiles["users"]) == 2
         assert batch_profiles["users"][0]["userId"] == alice
         assert batch_profiles["users"][0]["displayName"] == "Alice Cooper"
-        assert batch_profiles["users"][0]["avatarPreviewObjectId"] == "obj_avatar_alice_preview"
+        assert batch_profiles["users"][0]["avatarPreviewObjectId"] == "obj_avatar_alice_preview_new"
         assert batch_profiles["users"][1]["userId"] == bob
         assert batch_profiles["users"][1]["displayName"] == "Bob"
 
@@ -727,6 +786,8 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+        media_server.shutdown()
+        media_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

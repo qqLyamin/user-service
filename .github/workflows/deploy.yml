@@ -25,6 +25,8 @@ env:
   POSTGRES_SSLMODE: ${{ vars.POSTGRES_SSLMODE }}
   JWT_ISSUER: ${{ vars.JWT_ISSUER }}
   JWT_AUDIENCE: ${{ vars.JWT_AUDIENCE }}
+  MEDIA_SERVICE_BASE_URL: ${{ vars.MEDIA_SERVICE_BASE_URL || 'http://127.0.0.1:8830' }}
+  USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS: ${{ vars.USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS || '800' }}
 
 jobs:
   build-and-deploy:
@@ -111,7 +113,10 @@ jobs:
               "JWT_SECRET=${{ secrets.JWT_SECRET }}" \
               "JWT_ISSUER=${{ vars.JWT_ISSUER }}" \
               "JWT_AUDIENCE=${{ vars.JWT_AUDIENCE }}" \
-              "INTERNAL_TOKEN=${{ secrets.USER_SERVICE_SECRET }}" > "$ENV_FILE"
+              "INTERNAL_TOKEN=${{ secrets.USER_SERVICE_SECRET }}" \
+              "MEDIA_SERVICE_BASE_URL=${{ env.MEDIA_SERVICE_BASE_URL }}" \
+              "USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS=${{ env.USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS }}" \
+              "USER_SERVICE_AVATAR_CLEANUP_ENABLED=true" > "$ENV_FILE"
 
             cp "$RELEASE_DIR/deploy/user-service.service" /tmp/user-service.service
             sed -i "s|__DEPLOY_USER__|${{ vars.DEPLOY_USER }}|g" /tmp/user-service.service

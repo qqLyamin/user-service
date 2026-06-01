@@ -5,6 +5,7 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -607,6 +608,64 @@ struct UserProfile {
     std::string updated_at;
     std::optional<std::string> deleted_at;
 };
+
+struct AvatarRefs {
+    std::optional<std::string> legacy;
+    std::optional<std::string> preview;
+    std::optional<std::string> full;
+};
+
+AvatarRefs avatar_refs_from_json(const JsonObject& object) {
+    return AvatarRefs{
+        .legacy = optional_string(object, "avatarObjectId"),
+        .preview = optional_string(object, "avatarPreviewObjectId"),
+        .full = optional_string(object, "avatarFullObjectId"),
+    };
+}
+
+AvatarRefs avatar_refs_from_profile(const UserProfile& profile) {
+    return AvatarRefs{
+        .legacy = profile.avatar_object_id,
+        .preview = profile.avatar_preview_object_id,
+        .full = profile.avatar_full_object_id,
+    };
+}
+
+std::vector<std::string> avatar_ref_values(const AvatarRefs& refs) {
+    std::vector<std::string> values;
+    for (const auto& value : {refs.legacy, refs.preview, refs.full}) {
+        if (value.has_value() && !trim(*value).empty()) {
+            values.push_back(trim(*value));
+        }
+    }
+    return values;
+}
+
+std::vector<std::string> stale_avatar_refs(const AvatarRefs& old_refs, const AvatarRefs& new_refs) {
+    std::set<std::string> new_values;
+    for (const auto& value : avatar_ref_values(new_refs)) {
+        new_values.insert(value);
+    }
+
+    std::set<std::string> seen_old;
+    std::vector<std::string> stale;
+    for (const auto& value : avatar_ref_values(old_refs)) {
+        if (new_values.count(value) != 0) {
+            continue;
+        }
+        if (seen_old.insert(value).second) {
+            stale.push_back(value);
+        }
+    }
+    return stale;
+}
+
+bool delete_media_object_via_http(
+    const std::string& base_url,
+    const std::string& bearer_authorization,
+    const std::string& media_identifier,
+    int timeout_ms,
+    std::string& error_out);
 
 struct PrivacySettings {
     std::string user_id;
@@ -2791,6 +2850,9 @@ private:
     int internal_profile_cache_ttl_seconds_ = parse_int_env("USER_SERVICE_INTERNAL_PROFILE_CACHE_TTL_SECONDS", 30);
     int presence_ttl_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_TTL_SECONDS", 60);
     int presence_stale_ttl_seconds_ = parse_int_env("PRESENCE_STALE_TTL_SECONDS", presence_ttl_seconds_);
+    std::string media_service_base_url_ = trim(get_env("MEDIA_SERVICE_BASE_URL").value_or(""));
+    int media_delete_timeout_ms_ = parse_int_env("USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS", 800);
+    bool avatar_cleanup_enabled_ = parse_bool_env("USER_SERVICE_AVATAR_CLEANUP_ENABLED", true);
     bool presence_async_db_flush_ = parse_bool_env("USER_SERVICE_PRESENCE_ASYNC_DB_FLUSH", true);
     int presence_db_debounce_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_DB_DEBOUNCE_SECONDS", 20);
     int presence_flush_interval_seconds_ = parse_int_env("USER_SERVICE_PRESENCE_FLUSH_INTERVAL_SECONDS", 5);
@@ -4267,6 +4329,67 @@ private:
     void increment_metric(const std::string& key) {
         std::lock_guard<std::mutex> guard(metrics_mutex_);
         ++metrics_[key];
+    }
+
+    std::optional<std::string> authorization_header_for_media(const Request& request) const {
+        const auto it = request.headers.find("authorization");
+        if (it == request.headers.end()) {
+            return std::nullopt;
+        }
+        const auto value = trim(it->second);
+        if (value.empty() || value.find('\r') != std::string::npos || value.find('\n') != std::string::npos) {
+            return std::nullopt;
+        }
+        return value;
+    }
+
+    void schedule_stale_avatar_cleanup(
+        const std::string& actor_user_id,
+        const AvatarRefs& old_refs,
+        const AvatarRefs& new_refs,
+        const std::optional<std::string>& authorization_header) const {
+        const auto stale_refs = stale_avatar_refs(old_refs, new_refs);
+        if (stale_refs.empty()) {
+            return;
+        }
+        if (!avatar_cleanup_enabled_) {
+            std::cout << "phase=user.avatar.cleanup decision=skip reason=disabled actorUserId="
+                      << sanitize_log_value(actor_user_id)
+                      << " staleCount=" << stale_refs.size() << std::endl;
+            return;
+        }
+        if (media_service_base_url_.empty()) {
+            std::cout << "phase=user.avatar.cleanup decision=skip reason=media_service_base_url_unconfigured actorUserId="
+                      << sanitize_log_value(actor_user_id)
+                      << " staleCount=" << stale_refs.size() << std::endl;
+            return;
+        }
+        if (!authorization_header.has_value()) {
+            std::cout << "phase=user.avatar.cleanup decision=skip reason=missing_authorization actorUserId="
+                      << sanitize_log_value(actor_user_id)
+                      << " staleCount=" << stale_refs.size() << std::endl;
+            return;
+        }
+
+        const auto base_url = media_service_base_url_;
+        const auto auth = *authorization_header;
+        const auto timeout_ms = std::max(media_delete_timeout_ms_, 100);
+        std::thread([actor_user_id, stale_refs, base_url, auth, timeout_ms]() {
+            for (const auto& media_identifier : stale_refs) {
+                std::string error;
+                const bool ok = delete_media_object_via_http(base_url, auth, media_identifier, timeout_ms, error);
+                if (ok) {
+                    std::cout << "phase=user.avatar.cleanup decision=deleted actorUserId="
+                              << sanitize_log_value(actor_user_id)
+                              << " mediaId=" << sanitize_log_value(media_identifier) << std::endl;
+                } else {
+                    std::cout << "phase=user.avatar.cleanup decision=failed actorUserId="
+                              << sanitize_log_value(actor_user_id)
+                              << " mediaId=" << sanitize_log_value(media_identifier)
+                              << " error=" << sanitize_log_value(error) << std::endl;
+                }
+            }
+        }).detach();
     }
 
     std::string require_actor_user_id(const Request& request) {
@@ -6195,6 +6318,8 @@ private:
         const auto preferred_display_name = actor_display_name_from_jwt(request);
         const auto body = JsonParser(request.body).parse();
         const auto& object = require_object(body);
+        const auto avatar_patch = avatar_patch_from_json(object);
+        const auto media_authorization = authorization_header_for_media(request);
         if (db_.enabled()) {
             if (const auto display_name = optional_string(object, "displayName")) {
                 validate_display_name(*display_name);
@@ -6203,15 +6328,25 @@ private:
                 validate_username(*username);
             }
             db_.ensure_profile_exists(actor_user_id, preferred_display_name.value_or("User " + actor_user_id.substr(0, std::min<std::size_t>(8, actor_user_id.size()))));
+            AvatarRefs old_avatar_refs;
+            if (avatar_patch.any()) {
+                if (const auto existing_profile = db_.get_profile(actor_user_id)) {
+                    old_avatar_refs = avatar_refs_from_json(*existing_profile);
+                }
+            }
             db_.patch_profile(actor_user_id, object);
+            request_db_profile_cache_.erase(request_cache_key("db_profile", actor_user_id));
             increment_metric("profile.updated");
-            if (avatar_patch_from_json(object).any()) {
+            if (avatar_patch.any()) {
                 increment_metric("profile.avatar_updated");
             }
             audit("profile.update", actor_user_id, actor_user_id);
             invalidate_user_cache(actor_user_id);
             const auto& profile = ensure_db_profile_exists_and_load(actor_user_id, preferred_display_name);
             const auto& privacy = ensure_db_privacy_exists_and_load(actor_user_id);
+            if (avatar_patch.any()) {
+                schedule_stale_avatar_cleanup(actor_user_id, old_avatar_refs, avatar_refs_from_json(profile), media_authorization);
+            }
             return json_response(200, profile_to_json(
                 profile,
                 optional_string(privacy, "profileVisibility"),
@@ -6223,6 +6358,7 @@ private:
                 false));
         }
         auto& profile = ensure_memory_profile_exists(actor_user_id, preferred_display_name);
+        const auto old_avatar_refs = avatar_refs_from_profile(profile);
 
         if (const auto display_name = optional_string(object, "displayName")) {
             validate_display_name(*display_name);
@@ -6234,7 +6370,6 @@ private:
         } else if (object.count("username") != 0 && object.at("username").is_null()) {
             profile.username = std::nullopt;
         }
-        const auto avatar_patch = avatar_patch_from_json(object);
         if (avatar_patch.legacy.present) {
             profile.avatar_object_id = avatar_patch.legacy.value;
             if (!avatar_patch.preview.present) {
@@ -6272,6 +6407,9 @@ private:
         audit("profile.update", actor_user_id, actor_user_id);
         increment_metric("profile.updated");
         invalidate_user_cache(actor_user_id);
+        if (avatar_patch.any()) {
+            schedule_stale_avatar_cleanup(actor_user_id, old_avatar_refs, avatar_refs_from_profile(profile), media_authorization);
+        }
         return json_response(200, profile_to_json(profile, require_privacy_const(actor_user_id), true, actor_user_id, "self_profile", "profile_updated", false));
     }
 
@@ -7450,6 +7588,179 @@ void configure_client_socket(SOCKET client_socket) {
 void close_client_socket(SOCKET client_socket) {
     shutdown(client_socket, SD_BOTH);
     closesocket(client_socket);
+}
+
+struct MediaServiceHttpUrl {
+    std::string host;
+    std::string port;
+    std::string path_prefix;
+};
+
+std::optional<MediaServiceHttpUrl> parse_media_service_http_url(const std::string& raw_url, std::string& error_out) {
+    std::string value = trim(raw_url);
+    while (!value.empty() && value.back() == '/') {
+        value.pop_back();
+    }
+    constexpr char scheme[] = "http://";
+    if (value.rfind(scheme, 0) != 0) {
+        error_out = "MEDIA_SERVICE_BASE_URL must start with http://";
+        return std::nullopt;
+    }
+    std::string rest = value.substr(sizeof(scheme) - 1U);
+    const auto path_pos = rest.find('/');
+    std::string authority = path_pos == std::string::npos ? rest : rest.substr(0, path_pos);
+    std::string path_prefix = path_pos == std::string::npos ? "" : rest.substr(path_pos);
+    if (authority.empty()) {
+        error_out = "MEDIA_SERVICE_BASE_URL host is empty";
+        return std::nullopt;
+    }
+    std::string host = authority;
+    std::string port = "80";
+    const auto colon_pos = authority.rfind(':');
+    if (colon_pos != std::string::npos && colon_pos + 1U < authority.size()) {
+        host = authority.substr(0, colon_pos);
+        port = authority.substr(colon_pos + 1U);
+    }
+    if (host.empty() || port.empty()) {
+        error_out = "MEDIA_SERVICE_BASE_URL host or port is empty";
+        return std::nullopt;
+    }
+    return MediaServiceHttpUrl{host, port, path_prefix};
+}
+
+std::string encode_media_identifier_path(const std::string& media_identifier) {
+    std::ostringstream oss;
+    oss << std::uppercase << std::hex;
+    for (unsigned char ch : media_identifier) {
+        const bool unreserved = std::isalnum(ch) != 0 || ch == '-' || ch == '_' || ch == '.' || ch == '~';
+        if (unreserved || ch == '/') {
+            oss << static_cast<char>(ch);
+        } else {
+            oss << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(ch);
+        }
+    }
+    return oss.str();
+}
+
+void configure_outbound_socket(SOCKET outbound_socket, const int timeout_ms) {
+    const int safe_timeout_ms = std::max(timeout_ms, 100);
+#ifdef _WIN32
+    DWORD socket_timeout_ms = static_cast<DWORD>(safe_timeout_ms);
+    setsockopt(outbound_socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&socket_timeout_ms), sizeof(socket_timeout_ms));
+    setsockopt(outbound_socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&socket_timeout_ms), sizeof(socket_timeout_ms));
+#else
+    timeval socket_timeout{};
+    socket_timeout.tv_sec = safe_timeout_ms / 1000;
+    socket_timeout.tv_usec = (safe_timeout_ms % 1000) * 1000;
+    setsockopt(outbound_socket, SOL_SOCKET, SO_RCVTIMEO, &socket_timeout, sizeof(socket_timeout));
+    setsockopt(outbound_socket, SOL_SOCKET, SO_SNDTIMEO, &socket_timeout, sizeof(socket_timeout));
+#endif
+}
+
+SOCKET connect_http_socket(const std::string& host, const std::string& port, const int timeout_ms, std::string& error_out) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* addresses = nullptr;
+    const int rc = getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses);
+    if (rc != 0 || addresses == nullptr) {
+        error_out = "getaddrinfo failed";
+        return INVALID_SOCKET;
+    }
+
+    SOCKET connected = INVALID_SOCKET;
+    for (addrinfo* current = addresses; current != nullptr; current = current->ai_next) {
+        SOCKET candidate = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
+        if (candidate == INVALID_SOCKET) {
+            continue;
+        }
+        configure_outbound_socket(candidate, timeout_ms);
+        if (connect(candidate, current->ai_addr, static_cast<int>(current->ai_addrlen)) == 0) {
+            connected = candidate;
+            break;
+        }
+        closesocket(candidate);
+    }
+    freeaddrinfo(addresses);
+    if (connected == INVALID_SOCKET) {
+        error_out = "connect failed";
+    }
+    return connected;
+}
+
+bool delete_media_object_via_http(
+    const std::string& base_url,
+    const std::string& bearer_authorization,
+    const std::string& media_identifier,
+    const int timeout_ms,
+    std::string& error_out) {
+    if (trim(media_identifier).empty()) {
+        error_out = "media identifier is empty";
+        return false;
+    }
+    if (bearer_authorization.find('\r') != std::string::npos || bearer_authorization.find('\n') != std::string::npos) {
+        error_out = "authorization header contains newline";
+        return false;
+    }
+
+    auto parsed = parse_media_service_http_url(base_url, error_out);
+    if (!parsed.has_value()) {
+        return false;
+    }
+
+    SOCKET outbound = connect_http_socket(parsed->host, parsed->port, timeout_ms, error_out);
+    if (outbound == INVALID_SOCKET) {
+        return false;
+    }
+
+    std::string path = parsed->path_prefix;
+    if (path.empty()) {
+        path = "/file/";
+    } else {
+        path += "/file/";
+    }
+    path += encode_media_identifier_path(trim(media_identifier));
+
+    const std::string host_header = parsed->port == "80" ? parsed->host : parsed->host + ":" + parsed->port;
+    std::ostringstream request;
+    request << "DELETE " << path << " HTTP/1.1\r\n"
+            << "Host: " << host_header << "\r\n"
+            << "Authorization: " << bearer_authorization << "\r\n"
+            << "Connection: close\r\n\r\n";
+
+    if (!socket_send_all(outbound, request.str())) {
+        closesocket(outbound);
+        error_out = "send failed";
+        return false;
+    }
+
+    std::string response;
+    char buffer[1024];
+    while (response.find("\r\n\r\n") == std::string::npos && response.size() < 8192U) {
+        const int received = recv(outbound, buffer, sizeof(buffer), 0);
+        if (received <= 0) {
+            break;
+        }
+        response.append(buffer, received);
+    }
+    closesocket(outbound);
+
+    const auto line_end = response.find("\r\n");
+    if (line_end == std::string::npos) {
+        error_out = "missing HTTP response";
+        return false;
+    }
+    std::stringstream status_line(response.substr(0, line_end));
+    std::string http_version;
+    int status = 0;
+    status_line >> http_version >> status;
+    if (status >= 200 && status < 300) {
+        return true;
+    }
+    error_out = "media-service DELETE returned HTTP " + std::to_string(status);
+    return false;
 }
 
 Response service_busy_response() {

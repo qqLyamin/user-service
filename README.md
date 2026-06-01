@@ -195,6 +195,14 @@ Profile responses include both the flat compatibility fields and the grouped con
 
 When avatar privacy hides the avatar, all avatar fields are returned as `null`.
 
+After a successful avatar replacement, `user-service` best-effort deletes stale old
+avatar objects through `media-service` `DELETE /file/{oldObjectId}`. The cleanup uses
+the same user `Authorization` header from `PATCH /v1/users/me`, skips old ids that are
+still referenced by the new `avatarObjectId`, `avatarPreviewObjectId`, or
+`avatarFullObjectId`, and does not fail the profile PATCH if media cleanup is
+temporarily unavailable. Configure it with `MEDIA_SERVICE_BASE_URL`,
+`USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS`, and `USER_SERVICE_AVATAR_CLEANUP_ENABLED`.
+
 ## Chat Pins
 
 Chat pins are user preferences owned by `user-service`; `chat-service` does not need to store or resolve pin state. Clients should load chats from `chat-service`, load pins from `user-service`, and sort matching chats above the regular list.
