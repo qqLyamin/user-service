@@ -456,14 +456,30 @@ def main() -> int:
         )
         assert unauthorized_batch["error"] == "UNAUTHORIZED"
 
+        bob_avatar = request("PATCH", "/v1/users/me", {
+            "avatarPreviewObjectId": "obj_avatar_bob_preview",
+            "avatarFullObjectId": "obj_avatar_bob_full",
+        }, user_id=bob)
+        assert bob_avatar["avatarObjectId"] == "obj_avatar_bob_preview"
+        assert bob_avatar["avatar"]["fullObjectId"] == "obj_avatar_bob_full"
+
         privacy = request("PATCH", "/v1/users/me/privacy", {
             "profileVisibility": "friends_only",
             "dmPolicy": "friends_only",
             "friendRequestPolicy": "everyone",
             "lastSeenVisibility": "private",
-            "avatarVisibility": "friends_only",
+            "avatarVisibility": "private",
         }, user_id=bob)
         assert privacy["dmPolicy"] == "friends_only"
+        assert privacy["avatarVisibility"] == "private"
+
+        bob_internal_profile = request("GET", f"/internal/users/{bob}/profile", internal=True)
+        assert bob_internal_profile["avatarObjectId"] is None
+        assert bob_internal_profile["avatar"]["fullObjectId"] is None
+
+        bob_batch_profile = request("POST", "/internal/users/batch", {"userIds": [bob]}, internal=True)
+        assert bob_batch_profile["users"][0]["avatarPreviewObjectId"] is None
+        assert bob_batch_profile["users"][0]["avatar"]["previewObjectId"] is None
 
         denied_profile = request("POST", f"/internal/users/{bob}/authorize-profile-read", {"actorUserId": alice}, internal=True)
         assert denied_profile["allowed"] is False

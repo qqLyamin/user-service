@@ -3204,7 +3204,7 @@ private:
         health_cache_.reset();
     }
 
-    JsonObject internal_profile_contract_from_db_profile(const JsonObject& profile) const {
+    JsonObject internal_profile_contract_from_db_profile(const JsonObject& profile, const std::optional<JsonObject>& privacy) const {
         JsonObject contract{
             {"userId", profile.at("userId")},
             {"displayName", profile.at("displayName")},
@@ -3213,7 +3213,7 @@ private:
             {"avatarFullObjectId", profile.at("avatarFullObjectId")},
             {"profileStatus", profile.at("profileStatus")},
         };
-        normalize_avatar_contract(contract);
+        apply_internal_avatar_privacy(contract, privacy.has_value() ? optional_string(*privacy, "avatarVisibility") : std::nullopt);
         return contract;
     }
 
@@ -3288,7 +3288,8 @@ private:
         if (!profile.has_value()) {
             return error_response(404, "not_found", "User profile not found");
         }
-        const auto contract = internal_profile_contract_from_db_profile(*profile);
+        const auto privacy = db_.get_privacy_settings(user_id);
+        const auto contract = internal_profile_contract_from_db_profile(*profile, privacy);
         cache_internal_profile(user_id, contract);
         return json_response(200, contract);
     }
@@ -4657,6 +4658,14 @@ private:
         };
     }
 
+    static void apply_internal_avatar_privacy(JsonObject& object, const std::optional<std::string>& avatar_visibility) {
+        normalize_avatar_contract(object);
+        const auto visibility = avatar_visibility.value_or("public");
+        if (visibility == "private" || visibility == "friends_only") {
+            mask_avatar_contract(object);
+        }
+    }
+
     JsonObject raw_profile_to_json(const UserProfile& profile) const {
         return JsonObject{
             {"userId", profile.user_id},
@@ -5922,7 +5931,7 @@ private:
         return json_response(created ? 201 : 200, JsonObject{{"ok", true}, {"userId", user_id}, {"created", created}});
     }
 
-    JsonObject internal_profile_contract_json(const JsonObject& profile) const {
+    JsonObject internal_profile_contract_json(const JsonObject& profile, const std::optional<std::string>& avatar_visibility) const {
         JsonObject contract{
             {"userId", required_string(profile, "userId")},
             {"displayName", required_string(profile, "displayName")},
@@ -5931,11 +5940,11 @@ private:
             {"avatarFullObjectId", profile.at("avatarFullObjectId")},
             {"profileStatus", required_string(profile, "profileStatus")},
         };
-        normalize_avatar_contract(contract);
+        apply_internal_avatar_privacy(contract, avatar_visibility);
         return contract;
     }
 
-    JsonObject internal_profile_contract_json(const UserProfile& profile) const {
+    JsonObject internal_profile_contract_json(const UserProfile& profile, const std::optional<std::string>& avatar_visibility) const {
         JsonObject contract{
             {"userId", profile.user_id},
             {"displayName", profile.display_name},
@@ -5944,7 +5953,7 @@ private:
             {"avatarFullObjectId", profile.avatar_full_object_id.has_value() ? Json(*profile.avatar_full_object_id) : Json(nullptr)},
             {"profileStatus", profile.profile_status},
         };
-        normalize_avatar_contract(contract);
+        apply_internal_avatar_privacy(contract, avatar_visibility);
         return contract;
     }
 
@@ -5984,14 +5993,20 @@ private:
                 for (const auto& user_id : user_ids) {
                     const auto profile = db_.get_profile(user_id);
                     if (profile.has_value()) {
-                        users.emplace_back(internal_profile_contract_json(*profile));
+                        const auto privacy = db_.get_privacy_settings(user_id);
+                        users.emplace_back(internal_profile_contract_json(
+                            *profile,
+                            privacy.has_value() ? optional_string(*privacy, "avatarVisibility") : std::nullopt));
                     }
                 }
             } else {
                 for (const auto& user_id : user_ids) {
                     const auto profile_it = profiles_.find(user_id);
                     if (profile_it != profiles_.end()) {
-                        users.emplace_back(internal_profile_contract_json(profile_it->second));
+                        const auto privacy_it = privacy_.find(user_id);
+                        users.emplace_back(internal_profile_contract_json(
+                            profile_it->second,
+                            privacy_it != privacy_.end() ? std::optional<std::string>(privacy_it->second.avatar_visibility) : std::nullopt));
                     }
                 }
             }
@@ -6015,7 +6030,7 @@ private:
                 *profile,
                 privacy.has_value() ? optional_string(*privacy, "profileVisibility") : std::nullopt,
                 privacy.has_value() ? optional_string(*privacy, "avatarVisibility") : std::nullopt,
-                true,
+                false,
                 current_actor_for_log(),
                 "internal_profile",
                 "internal_contract",
@@ -6032,7 +6047,7 @@ private:
         }
         const auto& profile = require_profile_const(user_id);
         const auto& privacy = require_privacy_const(user_id);
-        const auto resolved = profile_to_json(profile, privacy, true, current_actor_for_log(), "internal_profile", "internal_contract", false);
+        const auto resolved = profile_to_json(profile, privacy, false, current_actor_for_log(), "internal_profile", "internal_contract", false);
         return json_response(200, JsonObject{
             {"userId", resolved.at("userId")},
             {"displayName", resolved.at("displayName")},
