@@ -1,219 +1,27 @@
-name: CI/CD User Service
-
+name: Roommy Home Manual Stage
 on:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
-  group: deploy-user-service-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  SERVICE_NAME: ${{ vars.SERVICE_NAME }}
-  SERVICE_PORT: ${{ vars.SERVICE_PORT }}
-  DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-  PUBLIC_BASE_HOST: ${{ vars.PUBLIC_BASE_HOST }}
-  DEPLOY_USER: ${{ vars.DEPLOY_USER }}
-  DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
-  DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
-  POSTGRES_HOST: ${{ vars.POSTGRES_HOST }}
-  POSTGRES_PORT: ${{ vars.POSTGRES_PORT }}
-  POSTGRES_DB: ${{ vars.POSTGRES_DB }}
-  POSTGRES_USER: ${{ vars.POSTGRES_USER }}
-  POSTGRES_SSLMODE: ${{ vars.POSTGRES_SSLMODE }}
-  JWT_ISSUER: ${{ vars.JWT_ISSUER }}
-  JWT_AUDIENCE: ${{ vars.JWT_AUDIENCE }}
-  MEDIA_SERVICE_BASE_URL: ${{ vars.MEDIA_SERVICE_BASE_URL || 'http://127.0.0.1:8830' }}
-  USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS: ${{ vars.USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS || '800' }}
-
+  group: roommy-home-user-service-stage
+  cancel-in-progress: false
 jobs:
-  build-and-deploy:
-    runs-on: ubuntu-22.04
-
+  stage:
+    if: github.ref == 'refs/heads/main'
+    runs-on: roommy-home-deploy-vm
+    timeout-minutes: 150
+    environment: stage
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake python3 postgresql-client
-
-      - name: Run tests
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release
-          python3 tests/spec_test.py
-          python3 tests/jwt_smoke_test.py
-
-      - name: Build binary
-        run: |
-          mkdir -p dist
-          cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-linux --config Release
-          cp build-linux/user-service dist/user-service
-          chmod +x dist/user-service
-
-      - name: Create release bundle
-        run: |
-          mkdir -p release/deploy
-          cp dist/user-service release/
-          cp .env.example release/.env.example
-          cp deploy/user-service.service release/deploy/user-service.service
-          cp -R migrations release/migrations
-          tar -C release -czf user-service.tar.gz .
-
-      - name: Upload bundle to server
-        uses: appleboy/scp-action@v0.1.7
+      - uses: actions/checkout@v4
         with:
-          host: ${{ vars.DEPLOY_HOST }}
-          username: ${{ vars.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ vars.DEPLOY_PORT }}
-          source: "user-service.tar.gz"
-          target: "/tmp"
-
-      - name: Deploy on server
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ vars.DEPLOY_HOST }}
-          username: ${{ vars.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ vars.DEPLOY_PORT }}
-          script_stop: true
-          script: |
-            set -euo pipefail
-
-            sudo mkdir -p "${{ vars.DEPLOY_PATH }}/releases"
-            sudo mkdir -p "${{ vars.DEPLOY_PATH }}/shared/env"
-            sudo chown -R "${{ vars.DEPLOY_USER }}:${{ vars.DEPLOY_USER }}" "${{ vars.DEPLOY_PATH }}"
-
-            SHA_SHORT="${{ github.sha }}"
-            SHA_SHORT="${SHA_SHORT:0:7}"
-            RELEASE_ID="$(date +%Y%m%d%H%M%S)-${SHA_SHORT}"
-            RELEASE_DIR="${{ vars.DEPLOY_PATH }}/releases/${RELEASE_ID}"
-            ENV_FILE="${{ vars.DEPLOY_PATH }}/shared/env/user-service.env"
-
-            mkdir -p "$RELEASE_DIR"
-            tar -xzf /tmp/user-service.tar.gz -C "$RELEASE_DIR"
-
-            install -m 600 /dev/null "$ENV_FILE"
-            printf '%s\n' \
-              "HTTP_ADDR=127.0.0.1:${{ vars.SERVICE_PORT }}" \
-              "" \
-              "POSTGRES_HOST=${{ vars.POSTGRES_HOST }}" \
-              "POSTGRES_PORT=${{ vars.POSTGRES_PORT }}" \
-              "POSTGRES_DB=${{ vars.POSTGRES_DB }}" \
-              "POSTGRES_USER=${{ vars.POSTGRES_USER }}" \
-              "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" \
-              "POSTGRES_SSLMODE=${{ vars.POSTGRES_SSLMODE }}" \
-              "" \
-              "JWT_SECRET=${{ secrets.JWT_SECRET }}" \
-              "JWT_ISSUER=${{ vars.JWT_ISSUER }}" \
-              "JWT_AUDIENCE=${{ vars.JWT_AUDIENCE }}" \
-              "INTERNAL_TOKEN=${{ secrets.USER_SERVICE_SECRET }}" \
-              "MEDIA_SERVICE_BASE_URL=${{ env.MEDIA_SERVICE_BASE_URL }}" \
-              "USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS=${{ env.USER_SERVICE_MEDIA_DELETE_TIMEOUT_MS }}" \
-              "USER_SERVICE_AVATAR_CLEANUP_ENABLED=true" > "$ENV_FILE"
-
-            cp "$RELEASE_DIR/deploy/user-service.service" /tmp/user-service.service
-            sed -i "s|__DEPLOY_USER__|${{ vars.DEPLOY_USER }}|g" /tmp/user-service.service
-            sed -i "s|__DEPLOY_PATH__|${{ vars.DEPLOY_PATH }}|g" /tmp/user-service.service
-            sudo install -m 0644 /tmp/user-service.service /etc/systemd/system/user-service.service
-            rm -f /tmp/user-service.service
-
-            ln -sfn "$RELEASE_DIR" "${{ vars.DEPLOY_PATH }}/current"
-            set -a
-            . "$ENV_FILE"
-            set +a
-            cd "${{ vars.DEPLOY_PATH }}/current"
-            ./user-service migrate up
-
-            sudo systemctl daemon-reload
-            sudo systemctl enable user-service
-            sudo systemctl restart user-service
-            sleep 2
-            sudo systemctl --no-pager --full status user-service
-
-      - name: Internal healthcheck
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ vars.DEPLOY_HOST }}
-          username: ${{ vars.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ vars.DEPLOY_PORT }}
-          script_stop: true
-          script: |
-            set -euo pipefail
-            curl -fsS http://127.0.0.1:${{ vars.SERVICE_PORT }}/health
-
-      - name: External healthcheck
-        run: |
-          set -euo pipefail
-          curl -fsS https://${PUBLIC_BASE_HOST}/user/health
-
-      - name: Acceptance smoke test
-        env:
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import base64
-          import hashlib
-          import hmac
-          import json
-          import os
-          import time
-          import urllib.error
-          import urllib.request
-
-          def b64url(data: bytes) -> str:
-              return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
-
-          header = {"alg": "HS256", "typ": "JWT"}
-          payload = {
-              "iss": os.environ["JWT_ISSUER"],
-              "sub": "ci-smoke-user",
-              "uid": "ci-smoke-user",
-              "name": "CI Smoke User",
-              "aud": [os.environ["JWT_AUDIENCE"]],
-              "iat": int(time.time()),
-              "exp": int(time.time()) + 300,
-          }
-          signing_input = f"{b64url(json.dumps(header, separators=(',', ':')).encode())}.{b64url(json.dumps(payload, separators=(',', ':')).encode())}"
-          signature = hmac.new(os.environ["JWT_SECRET"].encode(), signing_input.encode(), hashlib.sha256).digest()
-          token = f"{signing_input}.{b64url(signature)}"
-          base_url = f"https://{os.environ['PUBLIC_BASE_HOST']}/user"
-          headers = {"Authorization": f"Bearer {token}"}
-
-          def call(method: str, path: str, body=None):
-              data = None
-              req_headers = dict(headers)
-              if body is not None:
-                  req_headers["Content-Type"] = "application/json"
-                  data = json.dumps(body, separators=(",", ":")).encode()
-              request = urllib.request.Request(
-                  f"{base_url}{path}",
-                  data=data,
-                  method=method,
-                  headers=req_headers,
-              )
-              try:
-                  with urllib.request.urlopen(request, timeout=20) as response:
-                      return response.status, json.loads(response.read().decode())
-              except urllib.error.HTTPError as exc:
-                  body_text = exc.read().decode()
-                  raise SystemExit(f"{method} {path} failed with {exc.code}: {body_text}") from exc
-
-          before_status, before = call("GET", "/v1/users/me")
-          patch_status, patched = call("PATCH", "/v1/users/me", {"displayName": "CI Smoke Updated"})
-          after_status, after = call("GET", "/v1/users/me")
-
-          assert before_status == 200, before
-          assert patch_status == 200, patched
-          assert after.get('displayName') == 'CI Smoke Updated', (before, patched, after)
-          assert after.get('userId'), after
-          PY
+          clean: false
+          persist-credentials: false
+      - name: Build immutable local image
+        run: sudo /usr/local/sbin/roommy-home-ci build stage user-service "$GITHUB_SHA" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --checkout "$GITHUB_WORKSPACE"
+      - name: Preflight retained generation
+        run: sudo /usr/local/sbin/roommy-home-ci check stage user-service "$GITHUB_SHA" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Deploy retained generation
+        run: sudo /usr/local/sbin/roommy-home-ci deploy stage user-service "$GITHUB_SHA" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Verify Stage contracts and replicas
+        run: sudo /usr/local/sbin/roommy-home-ci verify stage user-service "$GITHUB_SHA" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"

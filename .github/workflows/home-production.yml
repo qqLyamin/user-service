@@ -1,0 +1,28 @@
+name: Roommy Home Production
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full commit SHA already verified on Stage
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: roommy-home-user-service-prod
+  cancel-in-progress: false
+jobs:
+  prod:
+    if: github.ref == 'refs/heads/main'
+    runs-on: roommy-home-deploy-vm
+    timeout-minutes: 30
+    environment: production
+    env:
+      REVISION: ${{ inputs.revision }}
+    steps:
+      - name: Require matching Stage image and successful regression
+        run: sudo /usr/local/sbin/roommy-home-ci check prod user-service "$REVISION" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Deploy with Production environment and replica count
+        run: sudo /usr/local/sbin/roommy-home-ci deploy prod user-service "$REVISION" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Verify Production contracts and replicas
+        run: sudo /usr/local/sbin/roommy-home-ci verify prod user-service "$REVISION" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
